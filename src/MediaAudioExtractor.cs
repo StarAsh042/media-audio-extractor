@@ -1279,6 +1279,77 @@ namespace MediaAudioExtractor
             return Text;
         }
 
+        /// <summary>把主题应用到整棵控件树。</summary>
+        public void Apply(Control root)
+        {
+            Form f = root as Form;
+            if (f != null) { f.BackColor = FormBack; f.ForeColor = Text; }
+
+            GroupBox gb = root as GroupBox;
+            if (gb != null) { gb.BackColor = FormBack; gb.ForeColor = Text; }
+
+            Label l = root as Label;
+            if (l != null)
+            {
+                l.BackColor = Color.Transparent;
+                l.ForeColor = RoleColor(Convert.ToString(l.Tag));
+            }
+
+            TextBox tb = root as TextBox;
+            if (tb != null)
+            {
+                bool isLog = Convert.ToString(tb.Tag) == "log";
+                tb.BackColor = isLog ? LogBack : InputBack;
+                tb.ForeColor = Text;
+                tb.BorderStyle = BorderStyle.FixedSingle;
+            }
+
+            ComboBox cb = root as ComboBox;
+            if (cb != null)
+            {
+                cb.BackColor = InputBack;
+                cb.ForeColor = Text;
+                cb.FlatStyle = Dark ? FlatStyle.Flat : FlatStyle.Standard;
+            }
+
+            NumericUpDown nu = root as NumericUpDown;
+            if (nu != null)
+            {
+                nu.BackColor = InputBack;
+                nu.ForeColor = Text;
+                nu.BorderStyle = BorderStyle.FixedSingle;
+            }
+
+            Button b = root as Button;
+            if (b != null)
+            {
+                if (Dark)
+                {
+                    b.FlatStyle = FlatStyle.Flat;
+                    b.UseVisualStyleBackColor = false;
+                    b.BackColor = ButtonBack;
+                    b.ForeColor = Text;
+                    b.FlatAppearance.BorderColor = ButtonBorder;
+                    b.FlatAppearance.MouseOverBackColor = Color.FromArgb(70, 75, 85);
+                    b.FlatAppearance.MouseDownBackColor = Color.FromArgb(46, 50, 58);
+                }
+                else
+                {
+                    b.FlatStyle = FlatStyle.System;
+                    b.UseVisualStyleBackColor = true;
+                    b.BackColor = SystemColors.Control;
+                    b.ForeColor = SystemColors.ControlText;
+                }
+            }
+
+            FlatProgress fp = root as FlatProgress;
+            if (fp != null) { fp.ApplyTheme(this); }
+
+            WaveformView wv = root as WaveformView;
+            if (wv != null) { wv.ApplyTheme(this); }
+
+            foreach (Control child in root.Controls) { Apply(child); }
+        }
     }
 
     // ------------------------------------------------------------------
