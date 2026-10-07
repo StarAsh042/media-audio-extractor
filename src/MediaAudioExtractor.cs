@@ -87,4 +87,34 @@ namespace MediaAudioExtractor
             return (total / 60).ToString("00") + ":" + (total % 60).ToString("00");
         }
     }
+
+    // ------------------------------------------------------------------
+    //  下载 / 转码 引擎
+    // ------------------------------------------------------------------
+    internal sealed class ExtractionRequest
+    {
+        public string Url;
+        public string OutDir;
+        public string Format = "mp3";
+        public double Start;
+        public double Duration;      // <=0 表示整段
+        public bool NoSection;
+    }
+
+    internal sealed class ExtractionResult
+    {
+        public string FilePath;
+        public double Duration;
+    }
+
+    internal sealed class AudioSession
+    {
+        public string SourcePath;    // 原始完整音频（工作目录内，ASCII 路径）
+        public string PreviewWav;    // 波形/区间读取用的 WAV
+        public string PlaybackPath;  // 试听播放的文件：本地文件=原文件本身；下载=试听 WAV
+        public string Title;
+        public double Duration;      // 秒
+        public string FormatNote;    // 例如 "m4a / 110 kbps"
+        public float[] Peaks;        // 解码时顺带算好的整段包络（无需再读一遍 WAV）
+    }
 }
