@@ -1280,4 +1280,96 @@ namespace MediaAudioExtractor
         }
 
     }
+
+    // ------------------------------------------------------------------
+    //  进度条：自绘（系统 ProgressBar 无法跟随深色主题）
+    // ------------------------------------------------------------------
+    internal sealed class FlatProgress : Control
+    {
+        private int _value;
+        private bool _marquee;
+        private int _offset;
+        private readonly System.Windows.Forms.Timer _anim = new System.Windows.Forms.Timer();
+
+        private Color _bar = Color.FromArgb(64, 148, 236);
+        private Color _track = Color.FromArgb(228, 231, 236);
+        private Color _border = Color.FromArgb(196, 201, 210);
+
+        public FlatProgress()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            _anim.Interval = 30;
+            _anim.Tick += delegate(object s, EventArgs e)
+            {
+                _offset = (_offset + 6) % 120;
+                Invalidate();
+            };
+        }
+
+        public int Value
+        {
+            get { return _value; }
+            set
+            {
+                int v = value;
+                if (v < 0) { v = 0; }
+                if (v > 100) { v = 100; }
+                if (v == _value) { return; }
+                _value = v;
+                Invalidate();
+            }
+        }
+
+        public bool Marquee
+        {
+            get { return _marquee; }
+            set
+            {
+                if (_marquee == value) { return; }
+                _marquee = value;
+                if (value) { _anim.Start(); } else { _anim.Stop(); }
+                Invalidate();
+            }
+        }
+
+        public void ApplyTheme(Theme t)
+        {
+            _bar = t.ProgressBar;
+            _track = t.ProgressTrack;
+            _border = t.ProgressBorder;
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            Rectangle rc = ClientRectangle;
+            using (SolidBrush tb = new SolidBrush(_track)) { g.FillRectangle(tb, rc); }
+
+            if (_marquee)
+            {
+                int w = Math.Max(40, rc.Width / 4);
+                int x = (int)((long)(rc.Width + w) * _offset / 120) - w;
+                Rectangle r = Rectangle.Intersect(new Rectangle(x, 0, w, rc.Height), rc);
+                using (SolidBrush b = new SolidBrush(_bar)) { g.FillRectangle(b, r); }
+            }
+            else if (_value > 0)
+            {
+                int w = (int)Math.Round(rc.Width * (_value / 100.0));
+                using (SolidBrush b = new SolidBrush(_bar)) { g.FillRectangle(b, 0, 0, w, rc.Height); }
+            }
+
+            using (Pen p = new Pen(_border))
+            {
+                g.DrawRectangle(p, 0, 0, rc.Width - 1, rc.Height - 1);
+            }
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) { _anim.Dispose(); }
+            base.Dispose(disposing);
+        }
+    }
 }
