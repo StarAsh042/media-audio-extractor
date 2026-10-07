@@ -2513,4 +2513,1324 @@ namespace MediaAudioExtractor
 
         public void Dispose() { Close(); }
     }
+
+    // ------------------------------------------------------------------
+    //  主界面
+    // ------------------------------------------------------------------
+    internal sealed class MainForm : Form
+    {
+        // 第 1 步
+        private TextBox _txtUrl;
+        private Button _btnPaste;
+        private ComboBox _cmbQuality;
+        private TextBox _txtOut;
+        private Button _btnBrowse;
+        private Button _btnDownload;
+        private Button _btnCancel;
+        private FlatProgress _barDown;
+        private Label _lblDownStatus;
+
+        // 第 2 步
+        private WaveformView _wave;
+        private Button _btnPlay;
+        private Button _btnStop;
+        private Button _btnAudition;
+        private Button _btnMarkStart;
+        private Button _btnMarkEnd;
+        private Label _lblTime;
+        private NumericUpDown _numStart;
+        private NumericUpDown _numEnd;
+        private Label _lblSelLen;
+        private Button _btnSelectAll;
+
+        // 第 3 步
+        private ComboBox _cmbFormat;
+        private TextBox _txtName;
+        private Button _btnExport;
+        private Label _lblExportStatus;
+
+        private TextBox _txtLog;
+
+        private readonly Extractor _engine = new Extractor();
+        private readonly Player _player = new Player();
+        private readonly System.Windows.Forms.Timer _ticker = new System.Windows.Forms.Timer();
+
+        private AudioSession _session;
+        private string _workDir;
+        private float[] _fullPeaks;
+        private int _peakReloadCount;      // 自检用：包络重算（读盘）次数
+        private volatile bool _busy;
+        private volatile bool _cancel;
+        private bool _syncing;
+        private bool _nameDirty;
+        private string _lastFile;
+
+        public MainForm()
+        {
+            BuildUi();
+            AllowDrop = true;
+            DragEnter += delegate(object s, DragEventArgs e)
+            {
+                if (e.Data == null) { return; }
+                if (e.Data.GetDataPresent(DataFormats.FileDrop) ||
+                    e.Data.GetDataPresent(DataFormats.Text)) { e.Effect = DragDropEffects.Copy; }
+            };
+            DragDrop += delegate(object s, DragEventArgs e)
+            {
+                if (e.Data == null) { return; }
+                // 从资源管理器拖进来的文件走 FileDrop，拖链接文本走 Text
+                if (e.Data.GetDataPresent(DataFormats.FileDrop))
+                {
+                    string[] files = (string[])e.Data.GetData(DataFormats.FileDrop);
+                    if (files != null && files.Length > 0) { _txtUrl.Text = files[0]; }
+                }
+                else if (e.Data.GetDataPresent(DataFormats.Text))
+                {
+                    _txtUrl.Text = Convert.ToString(e.Data.GetData(DataFormats.Text));
+                }
+            };
+
+            // 输入是本地文件还是网址，决定按钮文案与「音质」是否可用
+            _txtUrl.TextChanged += delegate(object s, EventArgs e) { UpdateSourceMode(); };
+
+            string def = Environment.GetFolderPath(Environment.SpecialFolder.MyMusic);
+            if (string.IsNullOrEmpty(def) || !Directory.Exists(def))
+            {
+                def = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+            }
+            _txtOut.Text = def;
+
+            _ticker.Interval = 80;
+            _ticker.Tick += OnTick;
+
+            ApplyTheme(Theme.Current());
+            SetBusy(false);
+            UpdateUiState();
+            _lblDownStatus.Text = "正在准备内置组件（首次运行需解压约 100 MB）…";
+            ThreadPool.QueueUserWorkItem(delegate { PrepareTools(); });
+        }
+
+        // ---------------- 界面搭建 ----------------
+        private void BuildUi()
+        {
+            Font uiFont;
+            try { uiFont = new Font("Microsoft YaHei UI", 9F); }
+            catch (Exception) { uiFont = SystemFonts.DefaultFont; }
+
+            SuspendLayout();
+            Text = "视频音频提取器 v" + Program.AppVersion + "  —  下载整段音频 → 拖动选区试听 → 裁剪保存";
+            Font = uiFont;
+            ClientSize = new Size(960, 680);
+            StartPosition = FormStartPosition.CenterScreen;
+            MinimumSize = new Size(940, 690);
+            BackColor = Color.FromArgb(247, 248, 250);
+            try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
+            catch (Exception) { }
+
+            // ---------- 第 1 步 ----------
+            GroupBox g1 = MakeGroup("第 1 步 · 获取完整音频（粘贴网址，或选择/拖入本地文件）", 12, 10, 936, 128);
+
+            Label l1 = MakeLabel("网址/文件：", 16, 28);
+            _txtUrl = new TextBox();
+            _txtUrl.Location = new Point(100, 25);
+            _txtUrl.Size = new Size(596, 23);
+            _txtUrl.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            _btnPaste = MakeButton("粘贴链接/路径", 708, 24, 120, 25, AnchorStyles.Top | AnchorStyles.Right);
+            _btnPaste.Click += OnPaste;
+
+            Label l2 = MakeLabel("音质：", 16, 60);
+            _cmbQuality = new ComboBox();
+            _cmbQuality.Location = new Point(90, 57);
+            _cmbQuality.Size = new Size(160, 23);
+            _cmbQuality.DropDownStyle = ComboBoxStyle.DropDownList;
+            _cmbQuality.BackColor = Color.White;
+            _cmbQuality.Items.AddRange(new object[]
+            {
+                "最好音质（自动）", "标准（≤128 kbps）", "省流量（≤64 kbps）"
+            });
+            _cmbQuality.SelectedIndex = 0;
+
+            Label l3 = MakeLabel("保存位置：", 262, 60);
+            _txtOut = new TextBox();
+            _txtOut.Location = new Point(336, 57);
+            _txtOut.Size = new Size(360, 23);
+            _txtOut.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            _btnBrowse = MakeButton("浏览…", 708, 56, 96, 25, AnchorStyles.Top | AnchorStyles.Right);
+            _btnBrowse.Click += OnBrowse;
+
+            // 操作按钮统一靠右（贴合「确定 / 取消在右下」的习惯），进度条占据左侧剩余空间
+            _btnDownload = MakeButton("① 下载完整音频", 706, 89, 140, 28, AnchorStyles.Top | AnchorStyles.Right);
+            _btnDownload.Font = new Font(uiFont, FontStyle.Bold);
+            _btnDownload.Click += OnDownload;
+
+            _btnCancel = MakeButton("取消", 854, 89, 70, 28, AnchorStyles.Top | AnchorStyles.Right);
+            _btnCancel.Click += OnCancel;
+
+            _barDown = new FlatProgress();
+            _barDown.Location = new Point(90, 94);
+            _barDown.Size = new Size(400, 18);
+            _barDown.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+
+            _lblDownStatus = new Label();
+            _lblDownStatus.Text = "";
+            _lblDownStatus.Location = new Point(498, 91);
+            _lblDownStatus.Size = new Size(200, 20);
+            _lblDownStatus.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+            _lblDownStatus.Tag = "accent";
+            _lblDownStatus.ForeColor = Color.FromArgb(30, 90, 170);
+
+            g1.Controls.AddRange(new Control[] { l1, _txtUrl, _btnPaste, l2, _cmbQuality,
+                                                 l3, _txtOut, _btnBrowse, _btnDownload, _btnCancel,
+                                                 _barDown, _lblDownStatus });
+
+            // ---------- 第 2 步 ----------
+            GroupBox g2 = MakeGroup("第 2 步 · 试听与选取片段（波形上拖动左右操作杆）", 12, 146, 936, 330);
+
+            _wave = new WaveformView();
+            _wave.Location = new Point(20, 24);
+            _wave.Size = new Size(896, 180);
+            _wave.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            _wave.SelectionChanged += OnWaveSelection;
+            _wave.SeekRequested += OnWaveSeek;
+            _wave.ViewChanged += OnWaveViewChanged;
+
+            _btnPlay = MakeButton("▶ 播放", 20, 212, 92, 30, AnchorStyles.Top | AnchorStyles.Left);
+            _btnPlay.Click += OnPlayPause;
+            _btnStop = MakeButton("■ 停止", 118, 212, 82, 30, AnchorStyles.Top | AnchorStyles.Left);
+            _btnStop.Click += OnStop;
+            _btnAudition = MakeButton("试听选区", 206, 212, 104, 30, AnchorStyles.Top | AnchorStyles.Left);
+            _btnAudition.Click += OnAudition;
+
+            Button btnZoomOut = MakeButton("－ 缩小", 316, 212, 62, 30, AnchorStyles.Top | AnchorStyles.Left);
+            btnZoomOut.Click += OnZoomOut;
+            Button btnZoomIn = MakeButton("＋ 放大", 382, 212, 62, 30, AnchorStyles.Top | AnchorStyles.Left);
+            btnZoomIn.Click += OnZoomIn;
+            Button btnFitAll = MakeButton("全览", 448, 212, 62, 30, AnchorStyles.Top | AnchorStyles.Left);
+            btnFitAll.Click += OnFitAll;
+
+            _lblTime = new Label();
+            _lblTime.Text = "--:--.- / --:--.-";
+            _lblTime.Location = new Point(520, 218);
+            _lblTime.Size = new Size(130, 20);
+
+            _btnMarkStart = MakeButton("起点=播放头", 700, 212, 106, 30, AnchorStyles.Top | AnchorStyles.Right);
+            _btnMarkStart.Click += OnMarkStart;
+            _btnMarkEnd = MakeButton("终点=播放头", 812, 212, 106, 30, AnchorStyles.Top | AnchorStyles.Right);
+            _btnMarkEnd.Click += OnMarkEnd;
+
+            Label l4 = MakeLabel("起始", 20, 256);
+            l4.Size = new Size(38, 22);
+            _numStart = new NumericUpDown();
+            _numStart.Location = new Point(60, 252);
+            _numStart.Size = new Size(84, 23);
+            _numStart.DecimalPlaces = 1;
+            _numStart.Increment = 1;
+            _numStart.Maximum = 100000;
+            _numStart.BackColor = Color.White;
+            _numStart.ValueChanged += OnSelectionNumbers;
+
+            Label l5 = MakeLabel("秒", 148, 256);
+            l5.Size = new Size(22, 22);
+            Label l6 = MakeLabel("结束", 176, 256);
+            l6.Size = new Size(38, 22);
+            _numEnd = new NumericUpDown();
+            _numEnd.Location = new Point(216, 252);
+            _numEnd.Size = new Size(84, 23);
+            _numEnd.DecimalPlaces = 1;
+            _numEnd.Increment = 1;
+            _numEnd.Maximum = 100000;
+            _numEnd.BackColor = Color.White;
+            _numEnd.ValueChanged += OnSelectionNumbers;
+
+            Label l7 = MakeLabel("秒", 304, 256);
+            l7.Size = new Size(22, 22);
+
+            _lblSelLen = new Label();
+            _lblSelLen.Text = "选区时长：0.0 秒";
+            _lblSelLen.Location = new Point(340, 256);
+            _lblSelLen.Size = new Size(170, 22);
+            _lblSelLen.Tag = "accent";
+            _lblSelLen.ForeColor = Color.FromArgb(30, 90, 170);
+
+            _btnSelectAll = MakeButton("全选", 596, 250, 90, 30, AnchorStyles.Top | AnchorStyles.Right);
+            _btnSelectAll.Click += OnSelectAll;
+            Button btnFocus = MakeButton("聚焦选区", 694, 250, 100, 30, AnchorStyles.Top | AnchorStyles.Right);
+            btnFocus.Click += OnFitSelection;
+            Button btnZero = MakeButton("回到开头", 802, 250, 116, 30, AnchorStyles.Top | AnchorStyles.Right);
+            btnZero.Click += OnGoStart;
+
+            g2.Controls.AddRange(new Control[] { _wave, _btnPlay, _btnStop, _btnAudition, btnZoomOut, btnZoomIn,
+                                                 btnFitAll, _lblTime, _btnMarkStart, _btnMarkEnd,
+                                                 l4, _numStart, l5, l6, _numEnd, l7,
+                                                 _lblSelLen, _btnSelectAll, btnFocus, btnZero });
+
+            // ---------- 第 3 步 ----------
+            GroupBox g3 = MakeGroup("第 3 步 · 裁剪并保存选区", 12, 484, 936, 96);
+
+            Label l8 = MakeLabel("输出格式：", 16, 28);
+            _cmbFormat = new ComboBox();
+            _cmbFormat.Location = new Point(90, 25);
+            _cmbFormat.Size = new Size(180, 23);
+            _cmbFormat.DropDownStyle = ComboBoxStyle.DropDownList;
+            _cmbFormat.BackColor = Color.White;
+            _cmbFormat.Items.AddRange(new object[]
+            {
+                "mp3（通用 192 kbps）", "m4a（原始音质直通）", "wav（无损，体积大）"
+            });
+            _cmbFormat.SelectedIndex = 0;
+
+            Label l9 = MakeLabel("文件名：", 286, 28);
+            l9.Size = new Size(58, 22);
+            _txtName = new TextBox();
+            _txtName.Location = new Point(350, 25);
+            _txtName.Size = new Size(342, 23);
+            _txtName.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            _txtName.TextChanged += OnNameChanged;
+
+            _btnExport = MakeButton("③ 导出选区", 708, 24, 96, 28, AnchorStyles.Top | AnchorStyles.Right);
+            _btnExport.Font = new Font(uiFont, FontStyle.Bold);
+            _btnExport.Click += OnExport;
+
+            Button btnOpenDir = MakeButton("打开文件夹", 812, 24, 108, 28, AnchorStyles.Top | AnchorStyles.Right);
+            btnOpenDir.Click += OnOpenFolder;
+
+            _lblExportStatus = new Label();
+            _lblExportStatus.Text = "选区：0.0 ~ 0.0 秒";
+            _lblExportStatus.Location = new Point(16, 62);
+            _lblExportStatus.Size = new Size(896, 20);
+            _lblExportStatus.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            _lblExportStatus.Tag = "muted";
+            _lblExportStatus.ForeColor = Color.FromArgb(90, 90, 100);
+
+            g3.Controls.AddRange(new Control[] { l8, _cmbFormat, l9, _txtName, _btnExport, btnOpenDir, _lblExportStatus });
+
+            // ---------- 日志 ----------
+            _txtLog = new TextBox();
+            _txtLog.Location = new Point(12, 588);
+            _txtLog.Size = new Size(936, 80);
+            _txtLog.Multiline = true;
+            _txtLog.ReadOnly = true;
+            _txtLog.ScrollBars = ScrollBars.Vertical;
+            _txtLog.WordWrap = false;
+            _txtLog.BackColor = Color.White;
+            _txtLog.Tag = "log";
+            _txtLog.Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
+
+            Controls.AddRange(new Control[] { g1, g2, g3, _txtLog });
+            ResumeLayout(false);
+            PerformLayout();
+        }
+
+        private static GroupBox MakeGroup(string text, int x, int y, int w, int h)
+        {
+            GroupBox g = new GroupBox();
+            g.Text = text;
+            g.Location = new Point(x, y);
+            g.Size = new Size(w, h);
+            g.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            return g;
+        }
+
+        private static Label MakeLabel(string text, int x, int y)
+        {
+            Label l = new Label();
+            l.Text = text;
+            l.Location = new Point(x, y);
+            l.Size = new Size(74, 22);
+            l.TextAlign = ContentAlignment.MiddleLeft;
+            return l;
+        }
+
+        private static Button MakeButton(string text, int x, int y, int w, int h, AnchorStyles anchor)
+        {
+            Button b = new Button();
+            b.Text = text;
+            b.Location = new Point(x, y);
+            b.Size = new Size(w, h);
+            b.Anchor = anchor;
+            b.FlatStyle = FlatStyle.System;
+            return b;
+        }
+
+        // ---------------- 组件准备 ----------------
+        private void PrepareTools()
+        {
+            try
+            {
+                Tools.Ensure();
+                _toolsReady = true;
+                Post(delegate
+                {
+                    _lblDownStatus.Text = "组件就绪";
+                    AppendLog("内置组件已就绪：" + Tools.Dir);
+                    UpdateUiState();
+                });
+            }
+            catch (Exception ex)
+            {
+                Post(delegate
+                {
+                    _lblDownStatus.Text = "组件准备失败";
+                    AppendLog("组件准备失败：" + ex.Message);
+                    if (!Silent)
+                    {
+                        MessageBox.Show(this, "内置组件解压失败：\n" + ex.Message, "错误",
+                                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    }
+                });
+            }
+        }
+
+        private string WorkDir
+        {
+            get
+            {
+                if (_workDir == null)
+                {
+                    _workDir = Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                        "MediaAudioExtractor", "work");
+                }
+                return _workDir;
+            }
+        }
+
+        // ---------------- 第 1 步：下载完整音频 ----------------
+        private void OnDownload(object sender, EventArgs e)
+        {
+            if (_busy) { return; }
+
+            // 输入可以是网址，也可以是本地音频/视频文件（拖拽、粘贴进来的路径同样走这里）
+            string raw = _txtUrl.Text.Trim();
+            // UNC 路径要在这里就拦住：ResolveLocalFile 内部的 File.Exists 本身
+            // 就会向对方主机发起 SMB 连接（可能泄露 NTLM 凭据）
+            if (Extractor.IsUncPath(raw))
+            {
+                AppendLog("✘ 已拒绝网络路径（\\\\ 开头）：载入它会向该地址发起 SMB 连接并可能泄露本机凭据。");
+                if (!Silent)
+                {
+                    MessageBox.Show(this,
+                        "不支持网络路径（\\\\ 开头）。\n" +
+                        "载入它会向该地址发起 SMB 连接并可能泄露本机凭据；\n" +
+                        "请先把文件复制到本地磁盘再载入。",
+                        "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+                return;
+            }
+            string localPath = Extractor.ResolveLocalFile(raw);
+            string url = null;
+            if (localPath == null)
+            {
+                Match m = Regex.Match(raw, @"https?://[^\s]+");
+                if (m.Success) { url = m.Value; }
+            }
+            if (localPath == null && url == null)
+            {
+                if (!Silent)
+                {
+                    MessageBox.Show(this,
+                        "请输入视频网址（以 http:// 或 https:// 开头），\n或选择一个本地音频、视频文件。",
+                        "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+                return;
+            }
+            string outDir = _txtOut.Text.Trim();
+            if (outDir.Length == 0)
+            {
+                if (!Silent) { MessageBox.Show(this, "请选择保存位置。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+                return;
+            }
+            try { Directory.CreateDirectory(outDir); }
+            catch (Exception ex)
+            {
+                _lblDownStatus.Text = "无法使用该保存位置";
+                if (!Silent)
+                {
+                    MessageBox.Show(this, "无法使用该保存位置：\n" + ex.Message, "提示",
+                                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+                return;
+            }
+
+            string quality = "best";
+            if (_cmbQuality.SelectedIndex == 1) { quality = "std"; }
+            else if (_cmbQuality.SelectedIndex == 2) { quality = "low"; }
+
+            // 必须真正 Close 而不能只 Stop：MCI 打开 preview.wav 后会一直持有该文件句柄，
+            // 不释放的话下一次载入时 ffmpeg 无法覆盖它（Permission denied → 退出码 -13）。
+            StopPlayback();
+            try { _player.Close(); } catch (Exception) { }
+            _session = null;
+            _playerReady = false;
+            _wave.HasAudio = false;
+            _wave.Peaks = null;
+            _wave.Invalidate();
+            _cancel = false;
+            _busy = true;
+            _barDown.Marquee = false;
+            _barDown.Value = 0;
+            UpdateUiState();
+            AppendLog(localPath != null ? "=== 载入本地文件 ===" : "=== 开始下载完整音频 ===");
+            if (localPath != null)
+            {
+                AppendLog("文件：" + localPath);
+                AppendLog("保存位置（仅作第 3 步导出目录）：" + outDir);
+            }
+            else
+            {
+                AppendLog("网址：" + url);
+                AppendLog("音质：" + _cmbQuality.Text + "    保存到：" + outDir);
+            }
+
+            string[] p = new string[] { url, localPath, outDir, quality };
+            Thread t = new Thread(new ThreadStart(delegate { JobDownload(p[0], p[1], p[2], p[3]); }));
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        private void JobDownload(string url, string localPath, string outDir, string quality)
+        {
+            Extractor ex = new Extractor();
+            ex.Log += delegate(string s) { LogLine(s); };
+            ex.Status += delegate(string s) { Post(delegate { _lblDownStatus.Text = s; }); };
+            ex.Progress += delegate(int v) { Post(delegate { SetProgress(_barDown, v); }); };
+            _cancelEngine = ex;
+            try
+            {
+                bool local = localPath != null;
+                // 解码过程中回调：先把波形区摆好，再随进度增量补画
+                Action<double, float[], double> onProgress = delegate(double dur, float[] partial, double frac)
+                {
+                    if (partial == null) { Post(delegate { BeginProgressiveWave(dur); }); }
+                    else { Post(delegate { UpdatePartialPeaks(partial, frac); }); }
+                };
+                AudioSession s = local
+                    ? ex.LoadLocal(localPath, WorkDir, onProgress)
+                    : ex.DownloadWhole(url, outDir, quality, WorkDir, onProgress);
+                Post(delegate { FinishDownload(s, s.Peaks, local); });
+            }
+            catch (Exception err)
+            {
+                bool cancelled = _cancel;
+                Post(delegate
+                {
+                    _busy = false;
+                    _barDown.Marquee = false;
+                    // BeginProgressiveWave 在解码开始时就把 HasAudio / Peaks 摆好了；
+                    // 载入没成功就必须复位，否则界面会为「没载入成的文件」画出半截波形
+                    _wave.HasAudio = false;
+                    _wave.Peaks = null;
+                    _wave.DecodedFraction = 1;
+                    _wave.Invalidate();
+                    UpdateUiState();
+                    if (cancelled)
+                    {
+                        _lblDownStatus.Text = "已取消";
+                        AppendLog("下载已取消。");
+                    }
+                    else
+                    {
+                        _lblDownStatus.Text = "下载失败";
+                        AppendLog("✘ 下载失败：" + err.Message);
+                        if (!Silent)
+                        {
+                            MessageBox.Show(this, err.Message, "下载失败",
+                                            MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        }
+                    }
+                });
+            }
+            finally
+            {
+                _cancelEngine = null;
+            }
+        }
+
+        /// <summary>
+        /// 解码刚开始时调用：先把波形区按总时长摆好（含默认选区），
+        /// 之后就能边解码边把波形从左往右画出来。
+        /// 此时 _session 仍为 null，所以界面整体保持"忙碌"状态，不会误操作。
+        /// </summary>
+        private void BeginProgressiveWave(double dur)
+        {
+            if (dur <= 0.05) { return; }
+            _wave.ResetView(dur);
+            _wave.Peaks = new float[Extractor.PeakBuckets];
+            _wave.DecodedFraction = 0;
+            _wave.HasAudio = true;
+            _wave.Position = 0;
+
+            _syncing = true;
+            decimal maxSec = (decimal)(Math.Floor(Math.Max(0.1, dur) * 10.0) / 10.0);
+            if (maxSec < 0.1m) { maxSec = 0.1m; }
+            _numStart.Maximum = maxSec;
+            _numEnd.Maximum = maxSec;
+            // 默认选区取整段时长的中间三分之一（与完成后的规则一致）
+            double selA = dur / 3.0;
+            double selB = dur * 2.0 / 3.0;
+            if (selB - selA < 0.1) { selA = 0; selB = dur; }
+            _wave.SelStart = selA;
+            _wave.SelEnd = selB;
+            SetNumValue(_numStart, selA);
+            SetNumValue(_numEnd, selB);
+            _syncing = false;
+
+            _wave.Invalidate();
+            UpdateSelectionLabels();
+            UpdateTimeLabel();
+        }
+
+        /// <summary>解码进行中：把已解码部分的包络与进度刷到界面。</summary>
+        private void UpdatePartialPeaks(float[] peaks, double fraction)
+        {
+            if (peaks == null) { return; }
+            _wave.Peaks = peaks;
+            _wave.DecodedFraction = fraction;
+            _wave.Invalidate();
+
+            int pct = (int)Math.Round(fraction * 100.0);
+            if (pct < 0) { pct = 0; }
+            if (pct > 100) { pct = 100; }
+            SetProgress(_barDown, pct);
+            _lblDownStatus.Text = "正在解码并绘制波形 " + pct + "%";
+        }
+
+        private void FinishDownload(AudioSession s, float[] peaks, bool local)
+        {
+            _session = s;
+            _barDown.Marquee = false;
+            _barDown.Value = 100;
+            _lblDownStatus.Text = local ? "载入完成" : "下载完成";
+
+            string error = _player.Open(s.PlaybackPath, s.Duration);
+            _playerReady = (error == null);
+            _playerError = error;
+            if (error != null)
+            {
+                AppendLog("⚠ 试听不可用：" + error);
+                _lblDownStatus.Text = local ? "已载入（试听不可用）" : "已下载（试听不可用）";
+            }
+
+            // 解码时已顺带算好包络；万一没有（旧路径）则补算一次
+            if (peaks == null || peaks.Length == 0)
+            {
+                double sec;
+                peaks = Extractor.ReadPeaksFromWav(s.PreviewWav, Extractor.PeakBuckets, out sec);
+            }
+            _fullPeaks = peaks;
+            _wave.Peaks = peaks;
+            _wave.DecodedFraction = 1;
+            _wave.ResetView(s.Duration);
+            _wave.HasAudio = true;
+            _wave.Position = 0;
+            _syncing = true;
+            // Maximum 向下取整到 0.1 秒：确保任何「一位小数」的取值都不会超过实际时长，
+            // 避免 NumericUpDown.Value 因越界抛异常（详见 SetNumValue 注释）
+            decimal maxSec = (decimal)(Math.Floor(Math.Max(0.1, s.Duration) * 10.0) / 10.0);
+            if (maxSec < 0.1m) { maxSec = 0.1m; }
+            _numStart.Maximum = maxSec;
+            _numEnd.Maximum = maxSec;
+            // 默认选区取「整段时长的中间三分之一」，以此为起点向两侧微调更顺手
+            double selA = s.Duration / 3.0;
+            double selB = s.Duration * 2.0 / 3.0;
+            if (selB - selA < 0.1) { selA = 0; selB = s.Duration; }   // 极短音频退化为整段
+            _wave.SelStart = selA;
+            _wave.SelEnd = selB;
+            SetNumValue(_numStart, selA);
+            SetNumValue(_numEnd, selB);
+            _syncing = false;
+            _nameDirty = false;
+            UpdateDefaultName();
+            _wave.Invalidate();
+            UpdateSelectionLabels();
+            UpdateTimeLabel();
+
+            _lblExportStatus.Text = (local ? "本地文件时长 " : "源文件时长 ") + Fmt.Clock(s.Duration) +
+                                    "，格式 " + s.FormatNote + "。拖动波形上的黄色操作杆选择要裁剪的片段。";
+            AppendLog("✔ 试听文件就绪，可播放并拖动选区。");
+            _busy = false;
+            UpdateUiState();
+        }
+
+        // ---------------- 播放控制 ----------------
+        private void OnPlayPause(object sender, EventArgs e)
+        {
+            if (!_player.IsOpen) { return; }
+            if (_player.IsPlaying)
+            {
+                _player.Pause();
+            }
+            else
+            {
+                double pos = _wave.Position * 1000.0;
+                if (pos >= _player.LengthMs - 50) { pos = 0; }
+                _player.PlayFrom(pos);
+                // 打开音频设备失败时不再静默（例如没有声卡、设备被独占）
+                string err = _player.LastError;
+                if (!string.IsNullOrEmpty(err)) { _lblDownStatus.Text = "⚠ " + err; }
+                _ticker.Start();
+            }
+            UpdateTransportUi();
+        }
+
+        private void OnStop(object sender, EventArgs e)
+        {
+            StopPlayback();
+            _wave.Position = 0;
+            _wave.Invalidate();
+            UpdateTimeLabel();
+        }
+
+        private void OnAudition(object sender, EventArgs e)
+        {
+            if (!_player.IsOpen) { return; }
+            _player.PlayRange(_wave.SelStart * 1000.0, _wave.SelEnd * 1000.0);
+            string err = _player.LastError;
+            if (!string.IsNullOrEmpty(err)) { _lblDownStatus.Text = "⚠ " + err; }
+            _ticker.Start();
+            UpdateTransportUi();
+        }
+
+        private void OnWaveSeek(object sender, EventArgs e)
+        {
+            if (!_player.IsOpen) { return; }
+            _player.Seek(_wave.Position * 1000.0);
+            UpdateTimeLabel();
+        }
+
+        private void StopPlayback()
+        {
+            _ticker.Stop();
+            try { _player.Stop(); } catch (Exception) { }
+            UpdateTransportUi();
+        }
+
+        private void OnTick(object sender, EventArgs e)
+        {
+            if (!_player.IsOpen) { _ticker.Stop(); return; }
+            if (!_player.IsPlaying)
+            {
+                _ticker.Stop();
+                UpdateTransportUi();
+                return;
+            }
+            _wave.Position = _player.PositionMs / 1000.0;
+            if (_wave.Position > _wave.Duration) { _wave.Position = _wave.Duration; }
+            _wave.Invalidate();
+            UpdateTimeLabel();
+        }
+
+        private void UpdateTransportUi()
+        {
+            _btnPlay.Text = _player.IsPlaying ? "⏸ 暂停" : "▶ 播放";
+        }
+
+        private void UpdateTimeLabel()
+        {
+            _lblTime.Text = Fmt.Clock(_wave.Position) + " / " + Fmt.Clock(_wave.Duration);
+        }
+
+        // ---------------- 选区 ----------------
+
+        /// <summary>
+        /// 安全地给 NumericUpDown 赋值。
+        /// NumericUpDown.Value 越界会抛 ArgumentOutOfRangeException（**不会**自动钳位到边界），
+        /// 而 Maximum 是未取整的真实时长、赋值前又做了 Math.Round(...,1) 取整，
+        /// 两者相差一个进位就会让「把选区拖到音频末尾」直接崩溃（如时长 1865.97 秒 → 取整得 1866.0）。
+        /// 故所有赋值统一走这里，先取整再钳位到 [Minimum, Maximum]。
+        /// </summary>
+        internal static void SetNumValue(NumericUpDown nu, double seconds)
+        {
+            if (double.IsNaN(seconds) || double.IsInfinity(seconds)) { seconds = 0; }
+            decimal v = (decimal)Math.Round(seconds, 1);
+            if (v < nu.Minimum) { v = nu.Minimum; }
+            if (v > nu.Maximum) { v = nu.Maximum; }
+            nu.Value = v;
+        }
+
+        private void OnWaveSelection(object sender, EventArgs e)
+        {
+            _syncing = true;
+            SetNumValue(_numStart, _wave.SelStart);
+            SetNumValue(_numEnd, _wave.SelEnd);
+            _syncing = false;
+            UpdateSelectionLabels();
+        }
+
+        private void OnSelectionNumbers(object sender, EventArgs e)
+        {
+            if (_syncing || !_wave.HasAudio) { return; }
+            double a = (double)_numStart.Value;
+            double b = (double)_numEnd.Value;
+            if (a > b) { b = a + 0.1; }
+            double dur = _wave.Duration;
+            if (b > dur) { b = dur; }
+            if (a < 0) { a = 0; }
+            if (a > b) { a = b; }
+            _syncing = true;
+            SetNumValue(_numStart, a);
+            SetNumValue(_numEnd, b);
+            _syncing = false;
+            a = (double)_numStart.Value;
+            b = (double)_numEnd.Value;
+            _wave.SelStart = a;
+            _wave.SelEnd = b;
+            _wave.Invalidate();
+            UpdateSelectionLabels();
+        }
+
+        private void OnMarkStart(object sender, EventArgs e)
+        {
+            if (!_wave.HasAudio) { return; }
+            double p = _wave.Position;
+            if (p > _wave.SelEnd - 0.05) { p = Math.Max(0, _wave.SelEnd - 0.05); }
+            _wave.SelStart = p;
+            _wave.Invalidate();
+            OnWaveSelection(null, EventArgs.Empty);
+        }
+
+        private void OnMarkEnd(object sender, EventArgs e)
+        {
+            if (!_wave.HasAudio) { return; }
+            double p = _wave.Position;
+            if (p < _wave.SelStart + 0.05) { p = Math.Min(_wave.Duration, _wave.SelStart + 0.05); }
+            _wave.SelEnd = p;
+            _wave.Invalidate();
+            OnWaveSelection(null, EventArgs.Empty);
+        }
+
+        private void OnSelectAll(object sender, EventArgs e)
+        {
+            if (!_wave.HasAudio) { return; }
+            _wave.SelStart = 0;
+            _wave.SelEnd = _wave.Duration;
+            _wave.Invalidate();
+            OnWaveSelection(null, EventArgs.Empty);
+        }
+
+        private void OnGoStart(object sender, EventArgs e)
+        {
+            StopPlayback();
+            _wave.Position = 0;
+            if (_player.IsOpen) { _player.Seek(0); }
+            _wave.Invalidate();
+            UpdateTimeLabel();
+        }
+
+        // ---------------- 缩放 / 平移 ----------------
+        private void OnZoomIn(object sender, EventArgs e)
+        {
+            _wave.ZoomAt(1.6, (_wave.ViewStart + _wave.ViewEnd) / 2.0);
+        }
+
+        private void OnZoomOut(object sender, EventArgs e)
+        {
+            _wave.ZoomAt(1.0 / 1.6, (_wave.ViewStart + _wave.ViewEnd) / 2.0);
+        }
+
+        private void OnFitAll(object sender, EventArgs e)
+        {
+            _wave.FitAll();
+        }
+
+        private void OnFitSelection(object sender, EventArgs e)
+        {
+            _wave.FitSelection();
+        }
+
+        /// <summary>当前包络是否覆盖可视区间。</summary>
+        private bool PeaksCoverView(double dur)
+        {
+            return _wave.PeakStart <= _wave.ViewStart + 0.001 &&
+                   _wave.PeakEnd >= _wave.ViewEnd - 0.001;
+        }
+
+        /// <summary>退回整段包络（常驻内存，无需读盘）。</summary>
+        private void UseFullPeaks(double dur)
+        {
+            _wave.Peaks = _fullPeaks;
+            _wave.PeakStart = 0;
+            _wave.PeakEnd = dur;
+        }
+
+        /// <summary>当前用的是否为整段包络。</summary>
+        private bool IsFullPeaks(double dur)
+        {
+            return _wave.PeakStart <= 0.001 && _wave.PeakEnd >= dur - 0.001;
+        }
+
+        /// <summary>
+        /// 视图变化后按可视区间重算高分辨率波形包络。
+        ///
+        /// ⚠ 平移时本方法会被**每个鼠标移动事件**调用，因此绝不能在这里无脑读盘：
+        /// 跨度几十秒时一次重算要几十毫秒（实测 75 秒跨度约 94 ms/步），会直接拖垮拖动手感。
+        /// 处理策略见下面四步。
+        /// </summary>
+        private void OnWaveViewChanged(object sender, EventArgs e)
+        {
+            if (_session == null || _fullPeaks == null) { return; }
+            double dur = _session.Duration <= 0 ? 1 : _session.Duration;
+
+            // 1) 交互进行中（右键平移 / 拖动操作杆）：一律不读盘。
+            //    现有包络是按「绝对时间」映射到像素的，位置依然正确，只是分辨率可能偏低；
+            //    若它已覆盖不到可视区间，就退回常驻内存的整段包络。
+            if (_wave.IsInteracting)
+            {
+                if (!PeaksCoverView(dur)) { UseFullPeaks(dur); }
+                _wave.Invalidate();
+                return;
+            }
+
+            double span = _wave.ViewEnd - _wave.ViewStart;
+
+            // 2) 整段（或跨度过大）：直接用常驻的整段包络，同样无需读盘
+            if ((_wave.ViewStart <= 0.001 && _wave.ViewEnd >= dur - 0.001) || span > 120)
+            {
+                UseFullPeaks(dur);
+                _wave.Invalidate();
+                return;
+            }
+
+            // 3) 已缓存的区间包络既覆盖当前视图、分辨率也够用 → 命中缓存，不重算。
+            //    只看「覆盖」是不够的：缩放进来的视图虽然落在缓存区间内，但可用的桶数
+            //    会随之变少，必须同时校验「可视区间内至少有约一桶一像素」。
+            if (!IsFullPeaks(dur) && PeaksCoverView(dur))
+            {
+                double cachedSpan = Math.Max(0.001, _wave.PeakEnd - _wave.PeakStart);
+                int have = _wave.Peaks == null ? 0 : _wave.Peaks.Length;
+                int need = Math.Max(400, _wave.ClientSize.Width);
+                double usable = have * (span / cachedSpan);
+                if (usable >= need * 0.9)
+                {
+                    _wave.Invalidate();
+                    return;
+                }
+            }
+
+            // 4) 重算：前后各留 50% 余量，使小幅平移 / 缩放能命中缓存（第 3 步）
+            double margin = span * 0.5;
+            double a = Math.Max(0, _wave.ViewStart - margin);
+            double b = Math.Min(dur, _wave.ViewEnd + margin);
+            int width = Math.Max(400, _wave.ClientSize.Width);
+            int buckets = (int)Math.Round(width * ((b - a) / Math.Max(0.001, span)));
+            if (buckets < 400) { buckets = 400; }
+            if (buckets > 12000) { buckets = 12000; }
+            double total;
+            _peakReloadCount++;
+            _wave.Peaks = Extractor.ReadPeaksRange(_session.PreviewWav, a, b, buckets, out total);
+            _wave.PeakStart = a;
+            _wave.PeakEnd = b;
+            _wave.Invalidate();
+        }
+
+        private void UpdateSelectionLabels()
+        {
+            double len = _wave.SelEnd - _wave.SelStart;
+            if (len < 0) { len = 0; }
+            _lblSelLen.Text = "选区时长：" + Fmt.Num(len) + " 秒";
+            _lblExportStatus.Text = "选区 " + Fmt.Clock(_wave.SelStart) + " ~ " + Fmt.Clock(_wave.SelEnd) +
+                                    "（" + Fmt.Num(len) + " 秒）" +
+                                    (_session != null ? "    源：" + _session.Title : "");
+            UpdateDefaultName();
+        }
+
+        private void UpdateDefaultName()
+        {
+            if (_nameDirty) { return; }
+            if (_session == null) { return; }
+            string suffix;
+            if (_wave.SelStart <= 0.001 && Math.Abs(_wave.SelEnd - _wave.Duration) < 0.05)
+            {
+                suffix = "_完整音频";
+            }
+            else
+            {
+                suffix = "_" + Fmt.Num(Math.Round(_wave.SelStart, 1)) + "s-" + Fmt.Num(Math.Round(_wave.SelEnd, 1)) + "s";
+            }
+            _settingName = true;
+            _txtName.Text = Extractor.SanitizeName(_session.Title) + suffix;
+            _settingName = false;
+        }
+
+        private bool _settingName;
+
+        private void OnNameChanged(object sender, EventArgs e)
+        {
+            if (!_settingName) { _nameDirty = true; }
+        }
+
+        // ---------------- 第 3 步：导出 ----------------
+        private void OnExport(object sender, EventArgs e)
+        {
+            if (_busy || _session == null) { return; }
+            double s = _wave.SelStart;
+            double en = _wave.SelEnd;
+            if (en - s < 0.05)
+            {
+                if (!Silent)
+                {
+                    MessageBox.Show(this, "选区太短，请拖动操作杆选择更长的片段。", "提示",
+                                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+                return;
+            }
+            string outDir = _txtOut.Text.Trim();
+            try { Directory.CreateDirectory(outDir); }
+            catch (Exception ex)
+            {
+                if (!Silent) { MessageBox.Show(this, "无法写入该目录：\n" + ex.Message, "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+                return;
+            }
+
+            string format = "mp3";
+            if (_cmbFormat.SelectedIndex == 1) { format = "m4a"; }
+            else if (_cmbFormat.SelectedIndex == 2) { format = "wav"; }
+
+            string name = _txtName.Text.Trim();
+            if (name.Length == 0) { name = "audio"; }
+
+            StopPlayback();
+            _cancel = false;
+            _busy = true;
+            UpdateUiState();
+            AppendLog("=== 导出选区 " + Fmt.Num(s) + "s ~ " + Fmt.Num(en) + "s ，格式 " + format + " ===");
+
+            string src = _session.SourcePath;
+            string wd = WorkDir;
+            Thread t = new Thread(new ThreadStart(delegate { JobExport(src, s, en - s, format, outDir, name, wd); }));
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        private void JobExport(string src, double start, double dur, string format,
+                               string outDir, string name, string workDir)
+        {
+            Extractor ex = new Extractor();
+            ex.Status += delegate(string s2) { Post(delegate { _lblExportStatus.Text = s2; }); };
+            ex.Log += delegate(string s2) { LogLine(s2); };
+            _cancelEngine = ex;
+            try
+            {
+                string path = ex.CutLocalFile(src, start, dur, format, outDir, name, workDir);
+                double real = Extractor.ProbeDuration(path);
+                Post(delegate
+                {
+                    _busy = false;
+                    _lastFile = path;
+                    UpdateUiState();
+                    _lblExportStatus.Text = "✔ 已导出：" + path + "（" + real.ToString("0.00") + " 秒）";
+                    AppendLog("✔ 导出完成，输出时长 " + real.ToString("0.00") + " 秒");
+                });
+            }
+            catch (Exception err)
+            {
+                bool cancelled = _cancel;
+                Post(delegate
+                {
+                    _busy = false;
+                    UpdateUiState();
+                    if (cancelled)
+                    {
+                        _lblExportStatus.Text = "已取消";
+                        AppendLog("导出已取消。");
+                    }
+                    else
+                    {
+                        _lblExportStatus.Text = "导出失败：" + err.Message;
+                        AppendLog("✘ 导出失败：" + err.Message);
+                        if (!Silent)
+                        {
+                            MessageBox.Show(this, err.Message, "导出失败",
+                                            MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        }
+                    }
+                });
+            }
+            finally
+            {
+                _cancelEngine = null;
+            }
+        }
+
+        private Extractor _cancelEngine;
+
+        // ---------------- 其它界面事件 ----------------
+        private void OnPaste(object sender, EventArgs e)
+        {
+            try
+            {
+                // 资源管理器「复制」文件 → 剪贴板里是文件列表，取第一个
+                if (Clipboard.ContainsFileDropList())
+                {
+                    System.Collections.Specialized.StringCollection files = Clipboard.GetFileDropList();
+                    if (files != null && files.Count > 0)
+                    {
+                        _txtUrl.Text = files[0];
+                        return;
+                    }
+                }
+                if (Clipboard.ContainsText())
+                {
+                    string t = Clipboard.GetText();
+                    Match m = Regex.Match(t, @"https?://[^\s]+");
+                    // 没有链接就按本地路径处理（「复制为路径」会带引号，交给 ResolveLocalFile 去引号）
+                    _txtUrl.Text = m.Success ? m.Value : t.Trim().Trim('"').Trim();
+                }
+            }
+            catch (Exception) { }
+        }
+
+        private void OnBrowse(object sender, EventArgs e)
+        {
+            using (FolderBrowserDialog d = new FolderBrowserDialog())
+            {
+                d.Description = "请选择保存位置";
+                d.ShowNewFolderButton = true;
+                if (Directory.Exists(_txtOut.Text)) { d.SelectedPath = _txtOut.Text; }
+                if (d.ShowDialog(this) == DialogResult.OK) { _txtOut.Text = d.SelectedPath; }
+            }
+        }
+
+        private void OnOpenFolder(object sender, EventArgs e)
+        {
+            string path = _lastFile;
+            if (string.IsNullOrEmpty(path) || !File.Exists(path))
+            {
+                path = _txtOut.Text;
+                if (!Directory.Exists(path)) { return; }
+                Process.Start("explorer.exe", "\"" + path + "\"");
+                return;
+            }
+            Process.Start("explorer.exe", "/select,\"" + path + "\"");
+        }
+
+        private void OnCancel(object sender, EventArgs e)
+        {
+            _cancel = true;
+            _lblDownStatus.Text = "正在取消 …";
+            Extractor ex = _cancelEngine;
+            if (ex != null) { ex.Cancel(); }
+        }
+
+        /// <summary>当前输入是否为本地文件。</summary>
+        private bool InputIsLocal()
+        {
+            return Extractor.ResolveLocalFile(_txtUrl.Text) != null;
+        }
+
+        /// <summary>
+        /// 输入是本地文件时：按钮改为「载入本地文件」，并停用「音质」（对本地文件无意义）。
+        /// </summary>
+        private void UpdateSourceMode()
+        {
+            bool local = InputIsLocal();
+            string want = local ? "① 载入本地文件" : "① 下载完整音频";
+            if (_btnDownload.Text != want) { _btnDownload.Text = want; }
+            if (!_busy) { _cmbQuality.Enabled = !local; }
+        }
+
+        private void UpdateUiState()
+        {
+            bool has = _session != null && _wave.HasAudio;
+            bool idle = !_busy;
+            bool tools = _toolsReady;
+            bool play = has && _playerReady;
+            bool local = InputIsLocal();
+
+            _txtUrl.Enabled = idle;
+            _txtOut.Enabled = idle;
+            _btnPaste.Enabled = idle;
+            _btnBrowse.Enabled = idle;
+            _cmbQuality.Enabled = idle && !local;
+            _btnDownload.Enabled = idle && tools;
+            _btnCancel.Enabled = !idle;
+
+            _wave.Enabled = has;
+            _btnPlay.Enabled = play && idle;
+            _btnStop.Enabled = play;
+            _btnAudition.Enabled = play && idle;
+            _btnMarkStart.Enabled = has && idle;
+            _btnMarkEnd.Enabled = has && idle;
+            _btnSelectAll.Enabled = has && idle;
+            _numStart.Enabled = has && idle;
+            _numEnd.Enabled = has && idle;
+
+            _cmbFormat.Enabled = has && idle;
+            _txtName.Enabled = has && idle;
+            _btnExport.Enabled = has && idle;
+        }
+
+        private volatile bool _toolsReady;
+        private bool _playerReady;
+
+        private void SetProgress(FlatProgress bar, int pct)
+        {
+            if (pct < 0)
+            {
+                bar.Marquee = true;
+                return;
+            }
+            bar.Marquee = false;
+            bar.Value = pct;
+        }
+
+        private void SetBusy(bool busy)
+        {
+            _busy = busy;
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (_busy && !Silent)
+            {
+                DialogResult r = MessageBox.Show(this, "任务正在进行，确定要取消并退出吗？",
+                                                 "确认退出", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+                if (r != DialogResult.Yes) { e.Cancel = true; return; }
+                _cancel = true;
+                Extractor ex = _cancelEngine;
+                if (ex != null) { ex.Cancel(); }
+            }
+            _ticker.Stop();
+            try { _player.Close(); } catch (Exception) { }
+            base.OnFormClosing(e);
+        }
+
+        // ---------------- 主题（跟随系统浅色 / 深色） ----------------
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
+        private Theme _theme;
+
+        internal void ApplyTheme(Theme t)
+        {
+            _theme = t;
+            t.Apply(this);
+            ApplyTitleBarTheme();
+            Invalidate(true);
+        }
+
+        private void ApplyTitleBarTheme()
+        {
+            if (!IsHandleCreated) { return; }
+            try
+            {
+                int v = (_theme != null && _theme.Dark) ? 1 : 0;
+                if (DwmSetWindowAttribute(Handle, 20, ref v, 4) != 0)
+                {
+                    DwmSetWindowAttribute(Handle, 19, ref v, 4);   // Win10 1809
+                }
+            }
+            catch (Exception) { }
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            ApplyTitleBarTheme();
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            if (m.Msg == 0x001A)      // WM_SETTINGCHANGE：系统主题变化
+            {
+                string k = null;
+                try { k = Marshal.PtrToStringUni(m.LParam); }
+                catch (Exception) { }
+                if (string.IsNullOrEmpty(k) || k == "ImmersiveColorSet" || k == "WindowMetrics")
+                {
+                    Theme t = Theme.Current();
+                    if (_theme == null || t.Dark != _theme.Dark) { ApplyTheme(t); }
+                }
+            }
+        }
+
+        // ---------------- 日志与线程调度 ----------------
+        private void Post(Action a)
+        {
+            if (IsDisposed) { return; }
+            try { BeginInvoke(a); }
+            catch (InvalidOperationException) { try { a(); } catch (Exception) { } }
+        }
+
+        private void LogLine(string s) { Post(delegate { AppendLog(s); }); }
+
+        private void AppendLog(string s)
+        {
+            if (_txtLog.IsDisposed) { return; }
+            _txtLog.AppendText(s + "\r\n");
+            string[] lines = _txtLog.Lines;
+            if (lines.Length > 400)
+            {
+                string[] keep = new string[200];
+                Array.Copy(lines, lines.Length - 200, keep, 0, 200);
+                _txtLog.Lines = keep;
+            }
+            _txtLog.SelectionStart = _txtLog.TextLength;
+            _txtLog.ScrollToCaret();
+        }
+
+        // ---------------- 自检接口（--dumpui / --uiauto 使用） ----------------
+        internal bool Silent;
+        internal bool ProbeBusy { get { return _busy; } }
+        internal string ProbeLog { get { return _txtLog.Text; } }
+        internal string ProbeDownStatus { get { return _lblDownStatus.Text; } }
+        internal string ProbeExportStatus { get { return _lblExportStatus.Text; } }
+        internal string ProbeOutFile { get { return _lastFile; } }
+        internal double ProbeDuration { get { return _session == null ? 0 : _session.Duration; } }
+        internal float[] ProbePeaks { get { return _wave.Peaks; } }
+        internal double ProbeSelStart { get { return _wave.SelStart; } }
+        internal double ProbeSelEnd { get { return _wave.SelEnd; } }
+        internal double ProbePosition { get { return _wave.Position; } }
+        internal Button ProbeDownloadButton { get { return _btnDownload; } }
+        internal Button ProbeExportButton { get { return _btnExport; } }
+        internal Button ProbePlayButton { get { return _btnPlay; } }
+        internal Button ProbeAuditionButton { get { return _btnAudition; } }
+        internal NumericUpDown ProbeStartNum { get { return _numStart; } }
+        internal NumericUpDown ProbeEndNum { get { return _numEnd; } }
+        internal string ProbePlayerError { get { return _playerError; } }
+        internal string ProbeWavPath { get { return _session == null ? null : _session.PreviewWav; } }
+        internal double ProbeViewStart { get { return _wave.ViewStart; } }
+        internal double ProbeViewEnd { get { return _wave.ViewEnd; } }
+        internal double ProbePeakStart { get { return _wave.PeakStart; } }
+        internal double ProbePeakEnd { get { return _wave.PeakEnd; } }
+
+        internal void ProbeZoom(double factor, double center) { _wave.ZoomAt(factor, center); }
+        internal void ProbeFitSelection() { _wave.FitSelection(); }
+        internal void ProbeFitAll() { _wave.FitAll(); }
+
+        internal int ProbePeakReloadCount { get { return _peakReloadCount; } }
+        internal void ProbeResetPeakReloadCount() { _peakReloadCount = 0; }
+        // 尚未开始载入时（Peaks 为空）返回 -1，避免把字段默认值误当成真实进度
+        internal double ProbeDecodedFraction { get { return _wave.Peaks == null ? -1 : _wave.DecodedFraction; } }
+
+        /// <summary>自检用：来回平移视图，模拟右键拖动的热路径。</summary>
+        internal void ProbePan(int steps, double dt)
+        {
+            for (int i = 0; i < steps; i++)
+            {
+                _wave.SimulatePanStep((i % 2 == 0) ? dt : -dt);
+            }
+        }
+
+        private string _playerError;
+
+        internal void ProbeFill(string url, string outDir, int qualityIndex)
+        {
+            if (!string.IsNullOrEmpty(url)) { _txtUrl.Text = url; }
+            if (!string.IsNullOrEmpty(outDir)) { _txtOut.Text = outDir; }
+            if (qualityIndex >= 0 && qualityIndex < _cmbQuality.Items.Count)
+            {
+                _cmbQuality.SelectedIndex = qualityIndex;
+            }
+        }
+
+        internal void ProbeSetSelection(double a, double b)
+        {
+            _wave.SelStart = a;
+            _wave.SelEnd = b;
+            _wave.Invalidate();
+            OnWaveSelection(null, EventArgs.Empty);
+        }
+    }
 }
