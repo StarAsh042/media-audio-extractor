@@ -54,6 +54,16 @@ namespace MediaAudioExtractor
         [STAThread]
         private static int Main(string[] args)
         {
+            if (args != null && args.Length > 0)
+            {
+                if (args[0] == "--dumpui") { return UiProbe.Run(args); }
+                if (args[0] == "--uiauto") { return UiProbe.RunAuto(args); }
+                if (args[0] == "--themetest") { return UiProbe.RunThemeTest(args); }
+                return Cli.Run(args);
+            }
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            Application.Run(new MainForm());
             return 0;
         }
     }
