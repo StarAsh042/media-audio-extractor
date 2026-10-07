@@ -1,0 +1,62 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 只读权限：本工作流只需要读代码、上传构建产物
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Build Windows exe
+    runs-on: windows-latest
+
+    steps:
+      # action 固定到 commit SHA（而不是 @v4 这种可变标签），
+      # 避免上游标签被移动/劫持后在 runner 上执行非预期代码。
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262   # v4
+
+      - name: Fetch embedded tools (yt-dlp + ffmpeg)
+        shell: pwsh
+        # PR 来自不可信分支时只下载并校验哈希，**不执行**这些二进制
+        # （fetch-tools.ps1 末尾会跑 --version 做自检）
+        run: |
+          if ('${{ github.event_name }}' -eq 'pull_request') {
+            ./tools/fetch-tools.ps1 -NoRun
+          } else {
+            ./tools/fetch-tools.ps1
+          }
+
+      - name: Build single-file exe
+        shell: pwsh
+        run: ./build.ps1
+
+      - name: Smoke test (UI layout self-check)
+        shell: pwsh
+        run: |
+          # 本程序是 GUI 子系统程序（csc /target:winexe）。
+          # PowerShell 用 & 调用这类程序时既不等待、也不会设置 $LASTEXITCODE，
+          # 于是 `$LASTEXITCODE -ne 0` 里 $null -ne 0 恒为真 —— 会导致本步骤
+          # 在程序还没跑完时就误判失败。必须用 Start-Process -Wait -PassThru 取退出码。
+          $exe = Join-Path $PWD 'dist/MediaAudioExtractor.exe'
+          $png = Join-Path $env:RUNNER_TEMP 'ui.png'
+          $p = Start-Process -FilePath $exe -ArgumentList '--dumpui', $png, 'light' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "dumpui failed with exit code $($p.ExitCode)" }
+
+          # 退出码 0 即代表「全部通过（无越界）」，这里再把报告打印出来便于排查
+          $report = "$png.txt"
+          if (-not (Test-Path $report)) { throw "missing self-check report: $report" }
+          Get-Content $report -Encoding UTF8
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4
+        with:
+          name: MediaAudioExtractor-${{ github.sha }}
+          path: dist/MediaAudioExtractor.exe
+          if-no-files-found: error
+          retention-days: 14
