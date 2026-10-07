@@ -4217,4 +4217,242 @@ namespace MediaAudioExtractor
             sb.AppendLine();
         }
     }
+
+    // ------------------------------------------------------------------
+    //  命令行模式
+    // ------------------------------------------------------------------
+    internal static class Cli
+    {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool AttachConsole(int dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetConsoleOutputCP(uint wCodePageID);
+
+        public static int Run(string[] args)
+        {
+            try
+            {
+                AttachConsole(-1);
+                SetConsoleOutputCP(65001);
+                Console.OutputEncoding = new UTF8Encoding(false);
+            }
+            catch (Exception) { }
+
+            Dictionary<string, string> o = ParseArgs(args);
+
+            if (o.ContainsKey("peaks")) { return DoPeaks(o); }
+            if (o.ContainsKey("preview")) { return DoPreview(o); }
+            if (o.ContainsKey("cut")) { return DoCut(o); }
+            if (o.ContainsKey("full")) { return DoFull(o); }
+            if (o.ContainsKey("url")) { return DoOneShot(o); }
+
+            Console.WriteLine("视频音频提取器 v" + Program.AppVersion + " — 命令行模式");
+            Console.WriteLine("  --cli --url <网址> --out <目录> [--start 0] [--dur 15] [--format mp3] [--no-section]");
+            Console.WriteLine("  --cli --full --url <网址> --out <目录> [--quality best|std|low]");
+            Console.WriteLine("  --cli --cut <本地文件> --out <目录> [--start 0] [--end 15] [--format mp3] [--name 名称]");
+            Console.WriteLine("  --cli --preview <本地文件> --wav <输出.wav> [--rate 44100]");
+            Console.WriteLine("  --cli --peaks <wav> [--buckets 1000]");
+            return 2;
+        }
+
+        // ---- 下载完整音频 ----
+        private static int DoFull(Dictionary<string, string> o)
+        {
+            string url = Get(o, "url");
+            string outDir = Get(o, "out");
+            if (string.IsNullOrEmpty(url) || string.IsNullOrEmpty(outDir))
+            {
+                Console.WriteLine("错误: --full 需要 --url 与 --out");
+                return 2;
+            }
+            string work = WorkDir();
+            try
+            {
+                Directory.CreateDirectory(outDir);
+                Extractor ex = MakeEngine();
+                AudioSession s = ex.DownloadWhole(url, outDir, Get(o, "quality"), work);
+                Console.WriteLine("标题: " + s.Title);
+                Console.WriteLine("完整时长: " + s.Duration.ToString("0.00") + " 秒");
+                Console.WriteLine("源文件: " + s.SourcePath);
+                Console.WriteLine("试听WAV: " + s.PreviewWav);
+                float[] peaks = (s.Peaks != null && s.Peaks.Length > 0)
+                              ? s.Peaks
+                              : ex.BuildPeaks(s.PreviewWav, Extractor.PeakBuckets);
+                double max = 0;
+                for (int i = 0; i < peaks.Length; i++) { if (peaks[i] > max) { max = peaks[i]; } }
+                Console.WriteLine("波形峰值点数: " + peaks.Length + " 最大=" + max.ToString("0.000"));
+                return 0;
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine("错误: " + e.Message);
+                return 1;
+            }
+        }
+
+        // ---- 从本地文件裁剪 ----
+        private static int DoCut(Dictionary<string, string> o)
+        {
+            string src = Get(o, "cut");
+            string outDir = Get(o, "out");
+            if (string.IsNullOrEmpty(src) || string.IsNullOrEmpty(outDir)) { Console.WriteLine("错误: --cut 需要 --out"); return 2; }
+            // 必须在 File.Exists 之前拦住 UNC —— 那一步就会发起 SMB 连接
+            if (Extractor.IsUncPath(src))
+            {
+                Console.WriteLine("错误: 不支持网络路径（\\\\ 开头），请先把文件复制到本地磁盘。");
+                return 2;
+            }
+            if (!File.Exists(src)) { Console.WriteLine("错误: 找不到文件 " + src); return 1; }
+            double start = ParseDouble(Get(o, "start"), 0);
+            double end = ParseDouble(Get(o, "end"), -1);
+            if (end <= 0) { end = ParseDouble(Get(o, "dur"), 15); if (end <= 0) { end = 15; } }
+            else { end = end - start; }
+            // 与 GUI 保持一致：空选区/过短选区明确报参数错误，而不是生成一个几乎空的文件
+            if (end <= 0.05)
+            {
+                Console.WriteLine("错误: 选区为空或过短（--end 必须大于 --start，且不短于 0.05 秒）。");
+                return 2;
+            }
+            string name = Get(o, "name");
+            if (string.IsNullOrEmpty(name)) { name = Path.GetFileNameWithoutExtension(src) + "_" + Fmt.Num(start) + "s-" + Fmt.Num(start + end) + "s"; }
+            try
+            {
+                Directory.CreateDirectory(outDir);
+                Extractor ex = MakeEngine();
+                string p = ex.CutLocalFile(src, start, end, Get(o, "format"), outDir, name, WorkDir());
+                double d = Extractor.ProbeDuration(p);
+                Console.WriteLine("结果文件: " + p);
+                Console.WriteLine("输出时长: " + d.ToString("0.00") + " 秒");
+                return 0;
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine("错误: " + e.Message);
+                return 1;
+            }
+        }
+
+        // ---- 生成试听 wav ----
+        private static int DoPreview(Dictionary<string, string> o)
+        {
+            string src = Get(o, "preview");
+            string wav = Get(o, "wav");
+            if (!File.Exists(src) || string.IsNullOrEmpty(wav)) { Console.WriteLine("错误: --preview 需要 --wav"); return 2; }
+            int rate = (int)ParseDouble(Get(o, "rate"), 44100);
+            try
+            {
+                string note;
+                Extractor ex = MakeEngine();
+                int code = ex.RunFfmpegPublic("-hide_banner -loglevel error -nostdin -y -i " + Extractor.Quote(src) +
+                                              " -vn -ac 1 -ar " + rate + " -c:a pcm_s16le " + Extractor.Quote(wav), out note);
+                if (code != 0) { Console.WriteLine("错误: ffmpeg 退出码 " + code + " " + note); return 1; }
+                Console.WriteLine("已生成: " + wav + " (" + new FileInfo(wav).Length / 1024 + " KB)");
+                return 0;
+            }
+            catch (Exception e) { Console.WriteLine("错误: " + e.Message); return 1; }
+        }
+
+        // ---- 波形峰值 ----
+        private static int DoPeaks(Dictionary<string, string> o)
+        {
+            string wav = Get(o, "peaks");
+            if (!File.Exists(wav)) { Console.WriteLine("错误: 找不到 " + wav); return 1; }
+            int buckets = (int)ParseDouble(Get(o, "buckets"), 1000);
+            double secs;
+            float[] peaks = Extractor.ReadPeaksFromWav(wav, buckets, out secs);
+            double max = 0, sum = 0;
+            for (int i = 0; i < peaks.Length; i++) { if (peaks[i] > max) { max = peaks[i]; } sum += peaks[i]; }
+            Console.WriteLine("点数=" + peaks.Length + "  时长=" + secs.ToString("0.00") + " 秒");
+            Console.WriteLine("最大=" + max.ToString("0.000") + "  平均=" + (sum / peaks.Length).ToString("0.000"));
+            StringBuilder bar = new StringBuilder();
+            for (int i = 0; i < 80 && i < peaks.Length; i++)
+            {
+                int h = (int)(peaks[i * peaks.Length / 80] * 8);
+                bar.Append(" .:-=+*#%@"[h]);
+            }
+            Console.WriteLine("波形示意: [" + bar + "]");
+            return 0;
+        }
+
+        // ---- 旧版一次性片段 ----
+        private static int DoOneShot(Dictionary<string, string> o)
+        {
+            ExtractionRequest req = new ExtractionRequest();
+            req.Url = Get(o, "url");
+            req.OutDir = Get(o, "out");
+            if (string.IsNullOrEmpty(req.OutDir)) { req.OutDir = Environment.CurrentDirectory; }
+            req.Start = ParseDouble(Get(o, "start"), 0);
+            req.Duration = ParseDouble(Get(o, "dur"), 0);
+            req.Format = Get(o, "format");
+            req.NoSection = o.ContainsKey("no-section");
+            try
+            {
+                Directory.CreateDirectory(req.OutDir);
+                Extractor ex = MakeEngine();
+                ExtractionResult r = ex.Run(req);
+                Console.WriteLine("结果文件: " + r.FilePath);
+                Console.WriteLine("输出时长: " + r.Duration.ToString("0.00") + " 秒");
+                return 0;
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine("错误: " + e.Message);
+                return 1;
+            }
+        }
+
+        private static Extractor MakeEngine()
+        {
+            Extractor ex = new Extractor();
+            ex.Log += delegate(string s) { Console.WriteLine(s); };
+            ex.Status += delegate(string s) { Console.WriteLine("[状态] " + s); };
+            return ex;
+        }
+
+        private static string WorkDir()
+        {
+            string d = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                                    "MediaAudioExtractor", "work");
+            Directory.CreateDirectory(d);
+            return d;
+        }
+
+        private static double ParseDouble(string s, double def)
+        {
+            double v;
+            if (string.IsNullOrEmpty(s)) { return def; }
+            return double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out v) ? v : def;
+        }
+
+        private static string Get(Dictionary<string, string> o, string key)
+        {
+            string v;
+            return o.TryGetValue(key, out v) ? v : null;
+        }
+
+        private static Dictionary<string, string> ParseArgs(string[] args)
+        {
+            Dictionary<string, string> o = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < args.Length; i++)
+            {
+                string a = args[i];
+                if (!a.StartsWith("--")) { continue; }
+                string key = a.Substring(2);
+                string val = null;
+                int eq = key.IndexOf('=');
+                if (eq >= 0)
+                {
+                    val = key.Substring(eq + 1);
+                    key = key.Substring(0, eq);
+                }
+                else if (i + 1 < args.Length && !args[i + 1].StartsWith("--"))
+                {
+                    val = args[++i];
+                }
+                o[key] = val;
+            }
+            return o;
+        }
+    }
 }
