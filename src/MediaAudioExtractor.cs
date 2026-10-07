@@ -3833,4 +3833,388 @@ namespace MediaAudioExtractor
             OnWaveSelection(null, EventArgs.Empty);
         }
     }
+
+    // ------------------------------------------------------------------
+    //  界面自检（隐藏模式）：--dumpui [截图路径] / --uiauto <网址> <目录> [格式] [截图]
+    // ------------------------------------------------------------------
+    internal static class UiProbe
+    {
+        public static int Run(string[] args)
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            string png = OptArg(args, 1);
+            string themeArg = args.Length > 2 ? args[2] : null;
+            if (themeArg == "dark") { Theme.Force = true; }
+            else if (themeArg == "light") { Theme.Force = false; }
+            StringBuilder report = new StringBuilder();
+            report.AppendLine("系统主题: " + (Theme.SystemIsDark() ? "深色" : "浅色") +
+                              (Theme.Force.HasValue ? "（自检强制）" : ""));
+
+            MainForm f = new MainForm();
+            f.Silent = true;
+            f.StartPosition = FormStartPosition.Manual;
+            f.Location = new Point(-4000, -4000);
+            f.ShowInTaskbar = false;
+            f.Show();
+            Pump(2000);
+            Snapshot(f, "初始尺寸 " + f.ClientSize.Width + " x " + f.ClientSize.Height, report);
+
+            if (png != null) { Save(f, png, report); }
+
+            f.Size = new Size(1100, 800);
+            Pump(500);
+            Snapshot(f, "放大后 " + f.ClientSize.Width + " x " + f.ClientSize.Height, report);
+
+            f.Size = f.MinimumSize;
+            Pump(500);
+            Snapshot(f, "最小尺寸 " + f.ClientSize.Width + " x " + f.ClientSize.Height, report);
+
+            f.Close();
+            Emit(report.ToString(), png);
+            return 0;
+        }
+
+        // 端到端：下载完整音频 → 设置选区 → 导出 → 校验
+        public static int RunAuto(string[] args)
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            string url = args.Length > 1 ? args[1] : "";
+            string outDir = args.Length > 2 ? args[2] : Environment.CurrentDirectory;
+            int quality = args.Length > 3 ? ParseInt(args[3], 0) : 0;
+            string png = OptArg(args, 4);
+            string themeArg = args.Length > 5 ? args[5] : null;
+            if (themeArg == "dark") { Theme.Force = true; }
+            else if (themeArg == "light") { Theme.Force = false; }
+            double selA = 0, selB = 0;      // 载入后按时长自适应，见「第 2 步」之前
+            StringBuilder sb = new StringBuilder();
+
+            MainForm f = new MainForm();
+            f.Silent = true;
+            f.StartPosition = FormStartPosition.Manual;
+            f.Location = new Point(-4000, -4000);
+            f.ShowInTaskbar = false;
+            f.Show();
+            Pump(1500);
+
+            f.ProbeFill(url, outDir, quality);
+            Stopwatch boot = Stopwatch.StartNew();
+            while (!f.ProbeDownloadButton.Enabled && boot.ElapsedMilliseconds < 60000)
+            {
+                Application.DoEvents();
+                Thread.Sleep(50);
+            }
+            sb.AppendLine("【第 1 步】点击下载完整音频（等待组件就绪 " +
+                          (boot.ElapsedMilliseconds / 1000.0).ToString("0.0") + " 秒）");
+
+            Stopwatch sw = Stopwatch.StartNew();
+            f.ProbeDownloadButton.PerformClick();
+            // 载入过程中采样波形进度，验证「边解码边画」
+            double firstFrac = -1, firstFracMs = -1, maxFrac = 0;
+            bool midShot = false;
+            int ticks = 0;
+            while (f.ProbeBusy && sw.ElapsedMilliseconds < 600000)
+            {
+                Application.DoEvents();
+                Thread.Sleep(40);
+                ticks++;
+                double fr = f.ProbeDecodedFraction;
+                if (fr > 0.0001 && firstFrac < 0) { firstFrac = fr; firstFracMs = sw.ElapsedMilliseconds; }
+                if (fr > maxFrac) { maxFrac = fr; }
+                // 解码到约 35% 时留一张截图，作为「边解码边画」的视觉证据
+                if (png != null && !midShot && fr >= 0.35)
+                {
+                    midShot = true;
+                    Save(f, png + ".loading.png", new StringBuilder());
+                }
+            }
+            Pump(600);
+            sb.AppendLine("  耗时: " + (sw.ElapsedMilliseconds / 1000.0).ToString("0.0") + " 秒");
+            sb.AppendLine("  渐进绘制: 首次出现波形 " +
+                          (firstFracMs < 0 ? "未出现" : "@" + (firstFracMs / 1000.0).ToString("0.0") + " 秒") +
+                          "，最终进度 " + (maxFrac * 100).ToString("0") + "%（轮询 " + ticks + " 次）");
+            sb.AppendLine("  忙碌已复位: " + (!f.ProbeBusy));
+            sb.AppendLine("  状态: " + f.ProbeDownStatus);
+            sb.AppendLine("  音频总时长: " + f.ProbeDuration.ToString("0.00") + " 秒");
+            sb.AppendLine("  试听文件: " + f.ProbeWavPath + "  存在=" +
+                          (f.ProbeWavPath != null && File.Exists(f.ProbeWavPath)));
+            sb.AppendLine("  波形峰值点数: " + (f.ProbePeaks == null ? 0 : f.ProbePeaks.Length));
+            sb.AppendLine("  默认选区: " + f.ProbeSelStart.ToString("0.0") + " ~ " + f.ProbeSelEnd.ToString("0.0"));
+            sb.AppendLine("  播放可用: " + f.ProbePlayButton.Enabled);
+
+            // 播放测试
+            if (f.ProbePlayButton.Enabled)
+            {
+                f.ProbePlayButton.PerformClick();
+                Pump(1200);
+                sb.AppendLine("  播放 1.2 秒后播放头位置: " + f.ProbePosition.ToString("0.00") + " 秒");
+                sb.AppendLine("  播放按钮文本: " + f.ProbePlayButton.Text);
+                f.ProbePlayButton.PerformClick();     // 暂停
+                Pump(200);
+            }
+
+            // 选区按时长自适应（取中间三分之一，与程序默认一致）。
+            // 以前硬编码 5~12 秒：对 ≤12 秒的音频会被钳成零长度，
+            // 导出步骤必然失败，看起来像产品缺陷，其实是自检自己的问题。
+            double adur = f.ProbeDuration;
+            selA = Math.Round(adur / 3.0 * 10) / 10;
+            selB = Math.Round(adur * 2.0 / 3.0 * 10) / 10;
+            if (selB - selA < 0.2) { selA = 0; selB = Math.Min(adur, 1.0); }
+            if (selB <= selA) { selB = selA + 0.1; }
+
+            sb.AppendLine("【第 2 步】设置选区 " + selA + " ~ " + selB + " 秒");
+            MainForm.SetNumValue(f.ProbeStartNum, selA);
+            MainForm.SetNumValue(f.ProbeEndNum, selB);
+            Pump(200);
+            sb.AppendLine("  波形选区: " + f.ProbeSelStart.ToString("0.0") + " ~ " + f.ProbeSelEnd.ToString("0.0"));
+            sb.AppendLine("  全览视图: " + f.ProbeViewStart.ToString("0.0") + " ~ " + f.ProbeViewEnd.ToString("0.0"));
+
+            sb.AppendLine("【第 2b 步】缩放");
+            f.ProbeZoom(1.6, 8.5);
+            Pump(150);
+            sb.AppendLine("  放大后视图: " + f.ProbeViewStart.ToString("0.0") + " ~ " + f.ProbeViewEnd.ToString("0.0") +
+                          "   包络区间: " + f.ProbePeakStart.ToString("0.0") + " ~ " + f.ProbePeakEnd.ToString("0.0"));
+
+            // 平移热路径：模拟右键拖动（每个鼠标事件都会走 SetView → ViewChanged → 重算包络）
+            sb.AppendLine("【第 2c 步】模拟平移 60 步（右键拖动热路径）");
+            double panSpan = f.ProbeViewEnd - f.ProbeViewStart;
+            double panStep = panSpan / 40.0;
+            f.ProbeResetPeakReloadCount();
+            Stopwatch swPan = Stopwatch.StartNew();
+            f.ProbePan(60, panStep);
+            swPan.Stop();
+            sb.AppendLine("  视图跨度: " + panSpan.ToString("0.0") + " 秒   每步平移: " + panStep.ToString("0.00") + " 秒");
+            sb.AppendLine("  耗时: " + swPan.ElapsedMilliseconds + " ms（" +
+                          (swPan.ElapsedMilliseconds / 60.0).ToString("0.00") + " ms/步）");
+            sb.AppendLine("  包络重算（读盘）次数: " + f.ProbePeakReloadCount + " / 60 步");
+
+            f.ProbeFitSelection();
+            Pump(150);
+            sb.AppendLine("  聚焦选区后视图: " + f.ProbeViewStart.ToString("0.0") + " ~ " + f.ProbeViewEnd.ToString("0.0") +
+                          "   包络区间: " + f.ProbePeakStart.ToString("0.0") + " ~ " + f.ProbePeakEnd.ToString("0.0"));
+            f.ProbeFitAll();
+            Pump(150);
+            sb.AppendLine("  恢复全览: " + f.ProbeViewStart.ToString("0.0") + " ~ " + f.ProbeViewEnd.ToString("0.0"));
+            f.ProbeFitSelection();
+            Pump(150);
+
+            sb.AppendLine("【第 3 步】导出选区");
+            sw = Stopwatch.StartNew();
+            f.ProbeExportButton.PerformClick();
+            while (f.ProbeBusy && sw.ElapsedMilliseconds < 300000) { Application.DoEvents(); Thread.Sleep(40); }
+            Pump(600);
+            sb.AppendLine("  耗时: " + (sw.ElapsedMilliseconds / 1000.0).ToString("0.0") + " 秒");
+            sb.AppendLine("  状态: " + f.ProbeExportStatus);
+            string file = f.ProbeOutFile;
+            sb.AppendLine("  结果文件: " + (file == null ? "<无>" : file));
+            bool exists = file != null && File.Exists(file);
+            sb.AppendLine("  文件是否存在: " + exists);
+            if (exists)
+            {
+                double d = Extractor.ProbeDuration(file);
+                sb.AppendLine("  输出时长: " + d.ToString("0.00") + " 秒（期望 " + (selB - selA).ToString("0.0") + " 秒）");
+            }
+
+            // 二次载入回归：验证「上一份试听 WAV 仍被 MCI 播放器占用」时，再次载入不会失败
+            string second = args.Length > 6 ? args[6] : null;
+            bool ok2 = true;
+            if (second != null)
+            {
+                sb.AppendLine("【第 4 步】二次载入（回归：旧试听文件被占用时不应失败）");
+                sb.AppendLine("  来源: " + second);
+                f.ProbeFill(second, outDir, quality);
+                Stopwatch sw2 = Stopwatch.StartNew();
+                f.ProbeDownloadButton.PerformClick();
+                while (f.ProbeBusy && sw2.ElapsedMilliseconds < 300000) { Application.DoEvents(); Thread.Sleep(40); }
+                Pump(600);
+                sb.AppendLine("  耗时: " + (sw2.ElapsedMilliseconds / 1000.0).ToString("0.0") + " 秒");
+                sb.AppendLine("  状态: " + f.ProbeDownStatus);
+                sb.AppendLine("  音频总时长: " + f.ProbeDuration.ToString("0.00") + " 秒");
+                sb.AppendLine("  试听可用: " + f.ProbePlayButton.Enabled);
+                ok2 = f.ProbeDuration > 0.05;
+                sb.AppendLine("  二次载入: " + (ok2 ? "通过" : "失败"));
+            }
+
+            sb.AppendLine("--- 日志 ---");
+            sb.AppendLine(f.ProbeLog);
+
+            if (png != null) { Save(f, png, report: sb); }
+            f.Close();
+            Emit(sb.ToString(), png);
+            return (exists && ok2) ? 0 : 1;
+        }
+
+        // 运行时主题切换自检：模拟系统广播 WM_SETTINGCHANGE
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+        public static int RunThemeTest(string[] args)
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            string png = OptArg(args, 1);
+            string which = args.Length > 2 ? args[2] : null;
+            if (which == "light") { Theme.Force = false; }
+            if (which == "dark") { Theme.Force = true; }
+
+            StringBuilder sb = new StringBuilder();
+            MainForm f = new MainForm();
+            f.Silent = true;
+            f.StartPosition = FormStartPosition.Manual;
+            f.Location = new Point(-4000, -4000);
+            f.ShowInTaskbar = false;
+            f.Show();
+            Pump(1200);
+
+            bool darkBefore = Theme.SystemIsDark();
+            sb.AppendLine("初始主题: " + (darkBefore ? "深色" : "浅色"));
+            sb.AppendLine("  窗体背景 = " + C(f.BackColor));
+            Control log = FindTagged(f, "log");
+            sb.AppendLine("  日志框背景 = " + (log == null ? "?" : C(log.BackColor)));
+
+            // 翻转并广播，模拟用户在系统设置里切换主题
+            Theme.Force = !darkBefore;
+            IntPtr lp = Marshal.StringToHGlobalUni("ImmersiveColorSet");
+            try { SendMessage(f.Handle, 0x001A, IntPtr.Zero, lp); }
+            finally { Marshal.FreeHGlobal(lp); }
+            Pump(600);
+
+            bool darkAfter = Theme.SystemIsDark();
+            sb.AppendLine("广播后主题: " + (darkAfter ? "深色" : "浅色"));
+            sb.AppendLine("  窗体背景 = " + C(f.BackColor));
+            sb.AppendLine("  日志框背景 = " + (log == null ? "?" : C(log.BackColor)));
+            bool switched = darkBefore != darkAfter && log != null && log.BackColor != Color.White == darkAfter;
+            sb.AppendLine("运行时切换生效: " + (switched ? "是" : "否"));
+
+            if (png != null) { Save(f, png, sb); }
+            f.Close();
+            Emit(sb.ToString(), png);
+            return switched ? 0 : 1;
+        }
+
+        private static string C(Color c) { return c.R + "," + c.G + "," + c.B; }
+
+        private static Control FindTagged(Control root, string tag)
+        {
+            if (Convert.ToString(root.Tag) == tag) { return root; }
+            foreach (Control c in root.Controls)
+            {
+                Control r = FindTagged(c, tag);
+                if (r != null) { return r; }
+            }
+            return null;
+        }
+
+        private static int ParseInt(string s, int def)
+        {
+            int v;
+            return int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out v) ? v : def;
+        }
+
+        private static void Save(Form f, string png, StringBuilder report)
+        {
+            try
+            {
+                using (Bitmap bmp = new Bitmap(f.Width, f.Height))
+                {
+                    f.DrawToBitmap(bmp, new Rectangle(0, 0, f.Width, f.Height));
+                    bmp.Save(png, System.Drawing.Imaging.ImageFormat.Png);
+                }
+                if (report != null) { report.AppendLine("截图已保存: " + png); }
+            }
+            catch (Exception e) { if (report != null) { report.AppendLine("截图失败: " + e.Message); } }
+        }
+
+        /// <summary>
+        /// 取可选路径参数：空串/空白按「未提供」处理。
+        /// 否则 `--uiauto ... "" ""` 这种调用会写出 ".txt" 这类怪文件。
+        /// </summary>
+        private static string OptArg(string[] args, int index)
+        {
+            if (args.Length <= index) { return null; }
+            string s = args[index];
+            if (s == null) { return null; }
+            s = s.Trim();
+            return s.Length == 0 ? null : s;
+        }
+
+        private static void Emit(string text, string png)
+        {
+            try
+            {
+                string path = string.IsNullOrEmpty(png) ? "ui.txt" : png + ".txt";
+                File.WriteAllText(path, text, new UTF8Encoding(false));
+            }
+            catch (Exception) { }
+            try
+            {
+                Console.OutputEncoding = new UTF8Encoding(false);
+            }
+            catch (Exception) { }
+            Console.Write(text);
+        }
+
+        private static void Pump(int ms)
+        {
+            Stopwatch sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < ms)
+            {
+                Application.DoEvents();
+                Thread.Sleep(25);
+            }
+        }
+
+        private static void Snapshot(Form f, string title, StringBuilder sb)
+        {
+            float dpi = 96f;
+            try { using (Graphics g = f.CreateGraphics()) { dpi = g.DpiX; } }
+            catch (Exception) { }
+            sb.AppendLine("=== " + title + " ===  font=" + f.Font.Name + "  dpi=" + dpi);
+            int bad = 0;
+            foreach (Control top in f.Controls)
+            {
+                Rectangle client = f.ClientRectangle;
+                Rectangle r = top.Bounds;
+                bool inside = r.Left >= 0 && r.Top >= 0 && r.Right <= client.Width && r.Bottom <= client.Height;
+                if (!inside) { bad++; }
+                string text = top.Text == null ? "" : top.Text.Replace("\r", " ").Replace("\n", " ");
+                if (text.Length > 26) { text = text.Substring(0, 26) + "…"; }
+                sb.AppendFormat("{0,-11} {1,-29} [{2,4},{3,4},{4,4},{5,4}] enabled={6,-5} inside={7}",
+                    top.GetType().Name, text, r.X, r.Y, r.Width, r.Height, top.Enabled, inside ? "yes" : "NO");
+                sb.AppendLine();
+
+                GroupBox gb = top as GroupBox;
+                if (gb == null) { continue; }
+                foreach (Control c in gb.Controls)
+                {
+                    Rectangle cr = c.Bounds;
+                    bool ok = cr.Left >= 0 && cr.Top >= 0 &&
+                              cr.Right <= gb.ClientSize.Width && cr.Bottom <= gb.ClientSize.Height;
+                    if (!ok) { bad++; }
+                    string t2 = c.Text == null ? "" : c.Text.Replace("\r", " ").Replace("\n", " ");
+                    if (t2.Length > 26) { t2 = t2.Substring(0, 26) + "…"; }
+                    sb.AppendFormat("   └ {0,-9} {1,-29} [{2,4},{3,4},{4,4},{5,4}] enabled={6,-5} inside={7}",
+                        c.GetType().Name, t2, cr.X, cr.Y, cr.Width, cr.Height, c.Enabled, ok ? "yes" : "NO");
+                    sb.AppendLine();
+                }
+                Control[] kids = new Control[gb.Controls.Count];
+                gb.Controls.CopyTo(kids, 0);
+                for (int i = 0; i < kids.Length; i++)
+                {
+                    for (int j = i + 1; j < kids.Length; j++)
+                    {
+                        if (kids[i] is Label && kids[j] is Label) { continue; }
+                        if (kids[i].Bounds.IntersectsWith(kids[j].Bounds))
+                        {
+                            bad++;
+                            sb.AppendLine("   !! 重叠(" + top.Text + "): " + kids[i].Text + " <-> " + kids[j].Text);
+                        }
+                    }
+                }
+            }
+            sb.AppendLine(bad == 0 ? "检查结果: 全部通过（无越界）" : ("检查结果: 发现 " + bad + " 处越界"));
+            sb.AppendLine();
+        }
+    }
 }
