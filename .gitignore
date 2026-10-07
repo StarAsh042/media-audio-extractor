@@ -1,0 +1,42 @@
+# ---- 构建产物 ----
+/dist/
+/build/
+/obj/
+*.exe
+*.pdb
+*.ilk
+
+# ---- 内置第三方组件（体积大，用 tools/fetch-tools.ps1 获取） ----
+/tools/yt-dlp.exe
+/tools/ffmpeg.exe
+/tools/ffprobe.exe
+/tools/*.zip
+/tools/*.download
+/tools/tmp/
+
+# ---- 运行/调试产物（只忽略仓库根目录，避免误伤将来新增的测试素材） ----
+*.log
+*.tmp
+/ui.txt
+/*.png
+/*.png.txt
+/*.wav
+/*.m4a
+/*.mp3
+
+# ---- 自检产物（曾误提交过一个名为 ".txt" 的怪文件） ----
+/.txt
+/.*.txt
+
+# ---- 内部审计/评审报告（含未修复漏洞，不得入库） ----
+/deliverables/
+
+# ---- 编辑器 ----
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# ---- 工作区元数据（AI 助手的工作记忆等，不入库） ----
+/.workbuddy-ai/
