@@ -1843,4 +1843,154 @@ namespace MediaAudioExtractor
             return steps[steps.Length - 1];
         }
     }
+
+    // ------------------------------------------------------------------
+    //  播放器统一接口：MCI（WAV）与 WPF MediaPlayer（m4a / mp3 等）都实现它
+    // ------------------------------------------------------------------
+    internal interface IAudioPlayer
+    {
+        bool IsOpen { get; }
+        bool IsPlaying { get; }
+        double LengthMs { get; }
+        double PositionMs { get; }
+        /// <summary>最近一次播放失败的原因（无错误时为空串）。</summary>
+        string LastError { get; }
+        string Open(string path);
+        void PlayFrom(double ms);
+        void PlayRange(double fromMs, double toMs);
+        void Pause();
+        void Stop();
+        void Seek(double ms);
+        void Close();
+    }
+
+    // ------------------------------------------------------------------
+    //  播放器：winmm MCI（waveaudio），支持定位 / 区间播放
+    // ------------------------------------------------------------------
+    internal sealed class MciPlayer : IDisposable, IAudioPlayer
+    {
+        [DllImport("winmm.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern int mciSendString(string command, StringBuilder ret, int retLen, IntPtr hwnd);
+
+        [DllImport("winmm.dll", CharSet = CharSet.Unicode)]
+        private static extern bool mciGetErrorString(int err, StringBuilder buf, int len);
+
+        private const string Alias = "maepreview";
+        private bool _open;
+
+        public bool IsOpen { get { return _open; } }
+        public double LengthMs { get; private set; }
+        /// <summary>MCI 的失败都通过 Open 的返回值上报，这里恒为空串。</summary>
+        public string LastError { get { return ""; } }
+
+        private static int Raw(string cmd, out string ret)
+        {
+            StringBuilder sb = new StringBuilder(256);
+            int r = mciSendString(cmd, sb, sb.Capacity, IntPtr.Zero);
+            ret = sb.ToString();
+            return r;
+        }
+
+        private static string ErrorText(int code)
+        {
+            StringBuilder sb = new StringBuilder(256);
+            mciGetErrorString(code, sb, sb.Capacity);
+            string s = sb.ToString();
+            return s.Length > 0 ? s : ("MCI 错误 " + code);
+        }
+
+        /// <summary>打开 WAV；成功返回 null，失败返回错误说明。</summary>
+        public string Open(string wavPath)
+        {
+            Close();
+            string ret;
+            int r = Raw("open \"" + wavPath + "\" type waveaudio alias " + Alias, out ret);
+            if (r != 0) { return ErrorText(r); }
+            _open = true;
+            Raw("set " + Alias + " time format milliseconds", out ret);
+            double len = 0;
+            if (Raw("status " + Alias + " length", out ret) == 0)
+            {
+                double.TryParse(ret.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out len);
+            }
+            LengthMs = len;
+            return null;
+        }
+
+        public double PositionMs
+        {
+            get
+            {
+                if (!_open) { return 0; }
+                string ret;
+                double v = 0;
+                if (Raw("status " + Alias + " position", out ret) == 0)
+                {
+                    double.TryParse(ret.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out v);
+                }
+                return v;
+            }
+        }
+
+        public bool IsPlaying
+        {
+            get
+            {
+                if (!_open) { return false; }
+                string ret;
+                if (Raw("status " + Alias + " mode", out ret) != 0) { return false; }
+                return ret.Trim() == "playing";
+            }
+        }
+
+        public void PlayFrom(double ms)
+        {
+            if (!_open) { return; }
+            string ret;
+            int m = (int)Math.Max(0, ms);
+            Raw("play " + Alias + " from " + m, out ret);
+        }
+
+        public void PlayRange(double fromMs, double toMs)
+        {
+            if (!_open) { return; }
+            string ret;
+            int a = (int)Math.Max(0, fromMs);
+            int b = (int)Math.Max(a + 50, toMs);
+            Raw("play " + Alias + " from " + a + " to " + b, out ret);
+        }
+
+        public void Pause()
+        {
+            if (!_open) { return; }
+            string ret;
+            Raw("pause " + Alias, out ret);
+        }
+
+        public void Stop()
+        {
+            if (!_open) { return; }
+            string ret;
+            Raw("stop " + Alias, out ret);
+            Raw("seek " + Alias + " to 0", out ret);
+        }
+
+        public void Seek(double ms)
+        {
+            if (!_open) { return; }
+            string ret;
+            Raw("seek " + Alias + " to " + (int)Math.Max(0, ms), out ret);
+        }
+
+        public void Close()
+        {
+            if (!_open) { return; }
+            string ret;
+            Raw("stop " + Alias, out ret);
+            Raw("close " + Alias, out ret);
+            _open = false;
+        }
+
+        public void Dispose() { Close(); }
+    }
 }
