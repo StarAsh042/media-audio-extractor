@@ -1372,4 +1372,404 @@ namespace MediaAudioExtractor
             base.Dispose(disposing);
         }
     }
+    // ------------------------------------------------------------------
+    //  波形控件：显示波形 + 选区操作杆 + 播放头，可拖动
+    // ------------------------------------------------------------------
+    internal sealed class WaveformView : Control
+    {
+        public float[] Peaks;
+        public double DecodedFraction = 1;   // 已解码进度 0..1；<1 时只画到该比例（渐进绘制）
+        public double Duration;
+        public double SelStart;
+        public double SelEnd;
+        public double Position;
+        public bool HasAudio;
+
+        public double ViewStart;      // 可见时间窗
+        public double ViewEnd;
+        public double PeakStart;      // Peaks 覆盖的时间范围
+        public double PeakEnd;
+
+        public event EventHandler SelectionChanged;
+        public event EventHandler SeekRequested;
+        public event EventHandler ViewChanged;
+
+        private enum Drag { None, Start, End, Body, Playhead }
+        private Drag _drag = Drag.None;
+        private double _dragOffset;
+        private bool _panning;
+        private int _panX;
+        private double _panA, _panB;
+        private bool _viewChangedDuringDrag;   // 交互期间视图变过 → 结束后需补一次包络重算
+
+        private const int Pad = 10;
+        private const int RulerH = 20;
+        private const int Grab = 7;
+        private Theme _theme = Theme.LightTheme();
+
+        public WaveformView()
+        {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw |
+                     ControlStyles.Selectable, true);
+            BackColor = _theme.WaveBack;
+            Cursor = Cursors.Hand;
+        }
+
+        public void ApplyTheme(Theme t)
+        {
+            _theme = t;
+            BackColor = t.WaveBack;
+            Invalidate();
+        }
+
+        private double Span
+        {
+            get
+            {
+                double s = ViewEnd - ViewStart;
+                return s <= 0.001 ? 1 : s;
+            }
+        }
+
+        public void ResetView(double duration)
+        {
+            Duration = duration;
+            ViewStart = 0;
+            ViewEnd = duration <= 0 ? 1 : duration;
+            PeakStart = 0;
+            PeakEnd = ViewEnd;
+        }
+
+        private void SetView(double a, double b)
+        {
+            if (Duration <= 0) { return; }
+            double minSpan = 0.5;
+            if (b - a < minSpan) { b = a + minSpan; }
+            if (a < 0) { b -= a; a = 0; }
+            if (b > Duration) { a -= (b - Duration); b = Duration; }
+            if (a < 0) { a = 0; }
+            if (b - a > Duration) { b = a + Duration; }
+            if (Math.Abs(a - ViewStart) < 0.0005 && Math.Abs(b - ViewEnd) < 0.0005) { return; }
+            ViewStart = a;
+            ViewEnd = b;
+            if (IsInteracting) { _viewChangedDuringDrag = true; }
+            EventHandler h = ViewChanged;
+            if (h != null) { h(this, EventArgs.Empty); }
+            Invalidate();
+        }
+
+        /// <summary>以 center 为中心缩放（factor&gt;1 放大）。</summary>
+        public void ZoomAt(double factor, double center)
+        {
+            if (Duration <= 0) { return; }
+            double span = Span / factor;
+            if (span > Duration) { span = Duration; }
+            if (span < 0.5) { span = 0.5; }
+            double a = center - span / 2.0;
+            SetView(a, a + span);
+        }
+
+        public void FitAll() { if (Duration > 0) { SetView(0, Duration); } }
+
+        /// <summary>是否正处于交互中（右键平移，或拖动操作杆）。</summary>
+        public bool IsInteracting { get { return _panning || _drag != Drag.None; } }
+
+        /// <summary>自检用：模拟一次「右键拖动」平移，走与真实拖动相同的分支。</summary>
+        internal void SimulatePanStep(double dt)
+        {
+            bool saved = _panning;
+            _panning = true;
+            try { SetView(ViewStart + dt, ViewEnd + dt); }
+            finally { _panning = saved; }
+        }
+
+        public void FitSelection()
+        {
+            if (Duration <= 0) { return; }
+            double len = SelEnd - SelStart;
+            if (len <= 0.05) { len = 0.05; }
+            double margin = Math.Max(1.0, len * 0.35);
+            double a = SelStart - margin;
+            double b = SelEnd + margin;
+            if (a < 0) { a = 0; }
+            if (b > Duration) { b = Duration; }
+            SetView(a, b);
+        }
+
+        private double TimeAt(int x)
+        {
+            int w = ClientSize.Width - Pad * 2;
+            if (w <= 10 || Duration <= 0) { return 0; }
+            double t = ViewStart + (x - Pad) / (double)w * Span;
+            if (t < 0) { t = 0; }
+            if (t > Duration) { t = Duration; }
+            return t;
+        }
+
+        private int XAt(double t)
+        {
+            int w = ClientSize.Width - Pad * 2;
+            if (Duration <= 0) { return Pad; }
+            return Pad + (int)Math.Round((t - ViewStart) / Span * w);
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (!HasAudio || Duration <= 0) { return; }
+            Focus();
+            if (e.Button == MouseButtons.Right || e.Button == MouseButtons.Middle)
+            {
+                _panning = true;
+                _panX = e.X;
+                _panA = ViewStart;
+                _panB = ViewEnd;
+                Cursor = Cursors.SizeAll;
+                return;
+            }
+            int xs = XAt(SelStart), xe = XAt(SelEnd);
+            if (Math.Abs(e.X - xs) <= Grab)
+            {
+                _drag = Drag.Start;
+            }
+            else if (Math.Abs(e.X - xe) <= Grab)
+            {
+                _drag = Drag.End;
+            }
+            else if (e.X > xs && e.X < xe)
+            {
+                _drag = Drag.Body;
+                _dragOffset = TimeAt(e.X) - SelStart;
+            }
+            else
+            {
+                _drag = Drag.Playhead;
+                Position = TimeAt(e.X);
+                RaiseSeek();
+                Invalidate();
+            }
+        }
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            base.OnMouseWheel(e);
+            if (!HasAudio) { return; }
+            double t = TimeAt(e.X);
+            ZoomAt(e.Delta > 0 ? 1.5 : (1.0 / 1.5), t);
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            if (!HasAudio || Duration <= 0) { return; }
+
+            if (_panning)
+            {
+                int w = Math.Max(10, ClientSize.Width - Pad * 2);
+                double dt = -(e.X - _panX) / (double)w * (_panB - _panA);
+                SetView(_panA + dt, _panB + dt);
+                return;
+            }
+
+            if (_drag != Drag.None)
+            {
+                double t = TimeAt(e.X);
+                if (_drag == Drag.Start)
+                {
+                    SelStart = Math.Min(t, SelEnd - 0.05);
+                    if (SelStart < 0) { SelStart = 0; }
+                }
+                else if (_drag == Drag.End)
+                {
+                    SelEnd = Math.Max(t, SelStart + 0.05);
+                    if (SelEnd > Duration) { SelEnd = Duration; }
+                }
+                else if (_drag == Drag.Body)
+                {
+                    double len = SelEnd - SelStart;
+                    double ns = t - _dragOffset;
+                    if (ns < 0) { ns = 0; }
+                    if (ns + len > Duration) { ns = Duration - len; }
+                    SelStart = ns;
+                    SelEnd = ns + len;
+                }
+                else
+                {
+                    Position = t;
+                    RaiseSeek();
+                }
+                RaiseSelection();
+                Invalidate();
+                return;
+            }
+
+            int xs2 = XAt(SelStart), xe2 = XAt(SelEnd);
+            if (Math.Abs(e.X - xs2) <= Grab || Math.Abs(e.X - xe2) <= Grab) { Cursor = Cursors.SizeWE; }
+            else if (e.X > xs2 && e.X < xe2) { Cursor = Cursors.SizeAll; }
+            else { Cursor = Cursors.Hand; }
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            bool restore = _viewChangedDuringDrag;
+            _drag = Drag.None;
+            _panning = false;
+            _viewChangedDuringDrag = false;
+            if (restore)
+            {
+                // 交互结束：按最终视图补一次包络重算（拖动过程中刻意跳过了，以保证手感）
+                EventHandler h = ViewChanged;
+                if (h != null) { h(this, EventArgs.Empty); }
+            }
+        }
+
+        private void RaiseSelection() { EventHandler h = SelectionChanged; if (h != null) { h(this, EventArgs.Empty); } }
+        private void RaiseSeek() { EventHandler h = SeekRequested; if (h != null) { h(this, EventArgs.Empty); } }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            Rectangle rc = ClientRectangle;
+            using (SolidBrush bg = new SolidBrush(BackColor)) { g.FillRectangle(bg, rc); }
+
+            int plotTop = 8;
+            int plotBottom = rc.Height - RulerH - 4;
+            int w = rc.Width - Pad * 2;
+            if (w <= 10 || plotBottom <= plotTop) { return; }
+
+            using (Pen border = new Pen(_theme.Ruler))
+            {
+                g.DrawRectangle(border, Pad - 1, plotTop - 1, w + 1, plotBottom - plotTop + 1);
+            }
+
+            if (!HasAudio || Peaks == null || Peaks.Length == 0 || Duration <= 0)
+            {
+                using (SolidBrush dim = new SolidBrush(_theme.Muted))
+                using (StringFormat sf = new StringFormat())
+                {
+                    sf.Alignment = StringAlignment.Center;
+                    sf.LineAlignment = StringAlignment.Center;
+                    g.DrawString("尚未获取音频 —— 请先在第 1 步下载网址，或载入本地文件",
+                                 Font, dim, new RectangleF(Pad, plotTop, w, plotBottom - plotTop), sf);
+                }
+                return;
+            }
+
+            int mid = (plotTop + plotBottom) / 2;
+            int half = (plotBottom - plotTop) / 2 - 2;
+            int n = Peaks.Length;
+            double ps = PeakStart, pe = PeakEnd;
+            if (pe <= ps) { pe = ps + 1; }
+
+            // 只画「已解码」的那一段：解码是流式的，波形随解码进度从左往右长出来
+            int drawnW = (int)Math.Round(w * (DecodedFraction < 0 ? 0 : (DecodedFraction > 1 ? 1 : DecodedFraction)));
+            if (drawnW < 0) { drawnW = 0; }
+            if (drawnW > w) { drawnW = w; }
+
+            using (SolidBrush wave = new SolidBrush(_theme.WaveBar))
+            {
+                for (int x = 0; x < drawnW; x++)
+                {
+                    double t = ViewStart + (x / (double)w) * Span;
+                    int i = (int)((t - ps) / (pe - ps) * n);
+                    if (i < 0) { i = 0; }
+                    if (i >= n) { i = n - 1; }
+                    int h = (int)Math.Round(Peaks[i] * half);
+                    if (h < 1) { h = 1; }
+                    g.FillRectangle(wave, Pad + x, mid - h, 1, h * 2);
+                }
+            }
+
+            // 尚未解码的部分画一条淡基线，示意"这里还没画完"
+            if (drawnW < w)
+            {
+                using (Pen rest = new Pen(_theme.Ruler))
+                {
+                    g.DrawLine(rest, Pad + drawnW, mid, Pad + w, mid);
+                }
+            }
+
+            int xs = XAt(SelStart), xe = XAt(SelEnd);
+            if (xe - xs < 2) { xe = xs + 2; }
+
+            using (SolidBrush shade = new SolidBrush(Color.FromArgb(_theme.DimAlpha, _theme.DimColor)))
+            {
+                int leftW = Math.Min(Math.Max(xs - Pad, 0), w);
+                if (leftW > 0) { g.FillRectangle(shade, Pad, plotTop, leftW, plotBottom - plotTop); }
+                int rightX = Math.Max(xe, Pad);
+                if (rightX < Pad + w) { g.FillRectangle(shade, rightX, plotTop, Pad + w - rightX, plotBottom - plotTop); }
+            }
+            using (SolidBrush sel = new SolidBrush(Color.FromArgb(_theme.SelFillAlpha,
+                                                                   _theme.SelEdge.R, _theme.SelEdge.G, _theme.SelEdge.B)))
+            {
+                int a = Math.Max(xs, Pad), b = Math.Min(xe, Pad + w);
+                if (b > a) { g.FillRectangle(sel, a, plotTop, b - a, plotBottom - plotTop); }
+            }
+            using (Pen selPen = new Pen(_theme.SelEdge, 2f))
+            {
+                g.DrawRectangle(selPen, xs, plotTop, xe - xs, plotBottom - plotTop);
+            }
+
+            DrawHandle(g, xs, plotTop, plotBottom, true);
+            DrawHandle(g, xe, plotTop, plotBottom, false);
+
+            int xp = XAt(Position);
+            if (xp >= Pad - 2 && xp <= Pad + w + 2)
+            {
+                using (Pen ph = new Pen(_theme.Playhead, 2f))
+                {
+                    g.DrawLine(ph, xp, plotTop - 4, xp, plotBottom + 4);
+                }
+                using (SolidBrush phb = new SolidBrush(_theme.Playhead))
+                {
+                    g.FillPolygon(phb, new Point[] {
+                        new Point(xp - 5, plotTop - 4), new Point(xp + 5, plotTop - 4), new Point(xp, plotTop + 4)
+                    });
+                }
+            }
+
+            using (Pen tick = new Pen(_theme.Ruler))
+            using (SolidBrush tl = new SolidBrush(_theme.RulerText))
+            {
+                double step = NiceStep(Span, w);
+                double first = Math.Ceiling(ViewStart / step) * step;
+                for (double t = first; t <= ViewEnd + 0.0001; t += step)
+                {
+                    int x = XAt(t);
+                    g.DrawLine(tick, x, plotBottom + 1, x, plotBottom + 5);
+                    string s = Fmt.Len(t);
+                    SizeF sz = g.MeasureString(s, Font);
+                    float tx = x - sz.Width / 2;
+                    if (tx < 0) { tx = 0; }
+                    if (tx + sz.Width > rc.Width) { tx = rc.Width - sz.Width; }
+                    g.DrawString(s, Font, tl, tx, plotBottom + 6);
+                }
+            }
+        }
+
+        private void DrawHandle(Graphics g, int x, int top, int bottom, bool isStart)
+        {
+            using (SolidBrush b = new SolidBrush(_theme.Handle))
+            {
+                g.FillRectangle(b, x - 3, top, 6, bottom - top);
+                Point[] tri = isStart
+                    ? new Point[] { new Point(x, top), new Point(x + 9, top), new Point(x, top + 9) }
+                    : new Point[] { new Point(x, top), new Point(x - 9, top), new Point(x, top + 9) };
+                g.FillPolygon(b, tri);
+            }
+        }
+
+        private static double NiceStep(double duration, int width)
+        {
+            double[] steps = { 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600 };
+            double target = duration / Math.Max(2.0, width / 90.0);
+            for (int i = 0; i < steps.Length; i++)
+            {
+                if (steps[i] >= target) { return steps[i]; }
+            }
+            return steps[steps.Length - 1];
+        }
+    }
 }
