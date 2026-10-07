@@ -57,4 +57,34 @@ namespace MediaAudioExtractor
             return 0;
         }
     }
+
+    // ------------------------------------------------------------------
+    //  时间格式化 / 小工具
+    // ------------------------------------------------------------------
+    internal static class Fmt
+    {
+        public static string Num(double v)
+        {
+            if (Math.Abs(v - Math.Round(v)) < 0.0005)
+            {
+                return ((long)Math.Round(v)).ToString(CultureInfo.InvariantCulture);
+            }
+            return v.ToString("0.###", CultureInfo.InvariantCulture);
+        }
+
+        public static string Clock(double seconds)
+        {
+            if (seconds < 0) { seconds = 0; }
+            int total = (int)seconds;
+            int m = total / 60;
+            int s = total % 60;
+            return m.ToString("00") + ":" + s.ToString("00") + "." + ((int)((seconds - total) * 10)).ToString("0");
+        }
+
+        public static string Len(double seconds)
+        {
+            int total = (int)Math.Round(seconds);
+            return (total / 60).ToString("00") + ":" + (total % 60).ToString("00");
+        }
+    }
 }
