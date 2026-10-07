@@ -1173,4 +1173,111 @@ namespace MediaAudioExtractor
             return 0;
         }
     }
+
+    // ------------------------------------------------------------------
+    //  主题：跟随系统浅色 / 深色
+    // ------------------------------------------------------------------
+    internal sealed class Theme
+    {
+        public bool Dark;
+
+        public Color FormBack, Text, Muted, Accent;
+        public Color InputBack, InputBorder, ButtonBack, ButtonBorder, LogBack;
+        public Color WaveBack, WaveBar, Ruler, RulerText;
+        public Color SelEdge, Handle, Playhead;
+        public Color ProgressBar, ProgressTrack, ProgressBorder;
+        public int DimAlpha;
+        public Color DimColor;
+        public int SelFillAlpha;
+
+        /// <summary>自检用：强制指定主题；null 表示跟随系统。</summary>
+        public static bool? Force;
+
+        public static bool SystemIsDark()
+        {
+            if (Force.HasValue) { return Force.Value; }
+            try
+            {
+                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(
+                           @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+                {
+                    object v = k == null ? null : k.GetValue("AppsUseLightTheme");
+                    if (v is int) { return ((int)v) == 0; }
+                }
+            }
+            catch (Exception) { }
+            return false;
+        }
+
+        public static Theme Current()
+        {
+            return SystemIsDark() ? DarkTheme() : LightTheme();
+        }
+
+        public static Theme LightTheme()
+        {
+            Theme t = new Theme();
+            t.Dark = false;
+            t.FormBack = Color.FromArgb(247, 248, 250);
+            t.Text = Color.FromArgb(32, 34, 38);
+            t.Muted = Color.FromArgb(110, 112, 122);
+            t.Accent = Color.FromArgb(28, 90, 175);
+            t.InputBack = Color.White;
+            t.InputBorder = Color.FromArgb(190, 194, 202);
+            t.ButtonBack = Color.FromArgb(240, 241, 244);
+            t.ButtonBorder = Color.FromArgb(170, 175, 185);
+            t.LogBack = Color.White;
+            t.WaveBack = Color.FromArgb(250, 251, 253);
+            t.WaveBar = Color.FromArgb(72, 138, 216);
+            t.Ruler = Color.FromArgb(196, 201, 210);
+            t.RulerText = Color.FromArgb(110, 116, 126);
+            t.SelEdge = Color.FromArgb(240, 160, 0);
+            t.Handle = Color.FromArgb(240, 160, 0);
+            t.Playhead = Color.FromArgb(220, 60, 60);
+            t.ProgressBar = Color.FromArgb(64, 148, 236);
+            t.ProgressTrack = Color.FromArgb(228, 231, 236);
+            t.ProgressBorder = Color.FromArgb(196, 201, 210);
+            t.DimAlpha = 130;
+            t.DimColor = Color.White;
+            t.SelFillAlpha = 55;
+            return t;
+        }
+
+        public static Theme DarkTheme()
+        {
+            Theme t = new Theme();
+            t.Dark = true;
+            t.FormBack = Color.FromArgb(32, 34, 39);
+            t.Text = Color.FromArgb(232, 234, 238);
+            t.Muted = Color.FromArgb(150, 155, 165);
+            t.Accent = Color.FromArgb(104, 172, 255);
+            t.InputBack = Color.FromArgb(45, 48, 54);
+            t.InputBorder = Color.FromArgb(74, 79, 88);
+            t.ButtonBack = Color.FromArgb(56, 60, 68);
+            t.ButtonBorder = Color.FromArgb(84, 89, 99);
+            t.LogBack = Color.FromArgb(24, 26, 30);
+            t.WaveBack = Color.FromArgb(20, 22, 26);
+            t.WaveBar = Color.FromArgb(96, 168, 255);
+            t.Ruler = Color.FromArgb(64, 70, 80);
+            t.RulerText = Color.FromArgb(158, 165, 178);
+            t.SelEdge = Color.FromArgb(255, 196, 0);
+            t.Handle = Color.FromArgb(255, 196, 0);
+            t.Playhead = Color.FromArgb(255, 90, 90);
+            t.ProgressBar = Color.FromArgb(72, 156, 240);
+            t.ProgressTrack = Color.FromArgb(48, 52, 60);
+            t.ProgressBorder = Color.FromArgb(70, 75, 84);
+            t.DimAlpha = 160;
+            t.DimColor = Color.Black;
+            t.SelFillAlpha = 46;
+            return t;
+        }
+
+        public Color RoleColor(string role)
+        {
+            if (role == "muted") { return Muted; }
+            if (role == "accent") { return Accent; }
+            return Text;
+        }
+
+    }
 }
