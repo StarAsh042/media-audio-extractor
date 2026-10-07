@@ -2458,4 +2458,59 @@ namespace MediaAudioExtractor
             }
         }
     }
+
+    // ------------------------------------------------------------------
+    //  播放器门面：按格式挑引擎，失败自动换另一条路。
+    //  · WAV  → MCI（waveaudio，最稳）
+    //  · 其它 → waveOut + ffmpeg（能直接播 m4a / mp3 等**原文件**，无需先转 WAV）
+    // ------------------------------------------------------------------
+    internal sealed class Player : IDisposable
+    {
+        private readonly MciPlayer _mci = new MciPlayer();
+        private readonly WaveOutPlayer _wave = new WaveOutPlayer();
+        private IAudioPlayer _active;
+
+        public bool IsOpen { get { return _active != null && _active.IsOpen; } }
+        public bool IsPlaying { get { return _active != null && _active.IsPlaying; } }
+        public double LengthMs { get { return _active == null ? 0 : _active.LengthMs; } }
+        public double PositionMs { get { return _active == null ? 0 : _active.PositionMs; } }
+        public string LastError { get { return _active == null ? "" : _active.LastError; } }
+
+        public string Open(string path) { return Open(path, 0); }
+
+        /// <summary>durationHint &gt; 0 时直接采用，省掉一次同步的 ffmpeg 时长探测。</summary>
+        public string Open(string path, double durationHint)
+        {
+            Close();
+            bool wav = path != null && path.ToLowerInvariant().EndsWith(".wav");
+            if (wav)
+            {
+                string e = _mci.Open(path);
+                if (e == null) { _active = _mci; return null; }
+            }
+            string err = _wave.Open(path, durationHint);
+            if (err == null) { _active = _wave; return null; }
+            if (!wav)
+            {
+                string e2 = _mci.Open(path);
+                if (e2 == null) { _active = _mci; return null; }
+            }
+            return err;
+        }
+
+        public void PlayFrom(double ms) { if (_active != null) { _active.PlayFrom(ms); } }
+        public void PlayRange(double a, double b) { if (_active != null) { _active.PlayRange(a, b); } }
+        public void Pause() { if (_active != null) { _active.Pause(); } }
+        public void Stop() { if (_active != null) { _active.Stop(); } }
+        public void Seek(double ms) { if (_active != null) { _active.Seek(ms); } }
+
+        public void Close()
+        {
+            try { _mci.Close(); } catch (Exception) { }
+            try { _wave.Close(); } catch (Exception) { }
+            _active = null;
+        }
+
+        public void Dispose() { Close(); }
+    }
 }
