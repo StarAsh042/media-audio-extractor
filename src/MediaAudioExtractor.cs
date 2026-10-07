@@ -1993,4 +1993,469 @@ namespace MediaAudioExtractor
 
         public void Dispose() { Close(); }
     }
+
+    // ------------------------------------------------------------------
+    //  播放器：winmm waveOut + 内置 ffmpeg 流式解码
+    //
+    //  为什么不用系统现成的播放能力：
+    //    · MCI 的 waveaudio 设备只认 WAV —— 原文件若是 m4a / mp3 就打不开
+    //    · WPF 的 MediaPlayer 实测打不开 m4a（它走 WMP 那套栈，MP4/AAC 支持不可靠）
+    //  所以这里用「ffmpeg 解码 → stdout → waveOut 流式输出」：
+    //  格式支持完全交给 ffmpeg（本来就要内置它），输出只依赖系统自带的 winmm，
+    //  依然不引入任何第三方音频库。
+    // ------------------------------------------------------------------
+    internal sealed class WaveOutPlayer : IDisposable, IAudioPlayer
+    {
+        private const int Rate = 44100;                 // 统一输出 44.1kHz 单声道 16bit
+        private const int ChunkMs = 80;                 // 每块 80ms
+        private const int ChunkSamples = Rate * ChunkMs / 1000;
+        private const int ChunkBytes = ChunkSamples * 2;
+        private const int ChunkCount = 3;               // 三缓冲，避免块间断音
+        private const int JoinTimeoutMs = 2000;
+
+        private const uint WAVE_MAPPER = 0xFFFFFFFF;
+        private const uint CALLBACK_NULL = 0;
+        private const uint TIME_MS = 0x0001;
+        private const uint TIME_SAMPLES = 0x0002;
+        private const uint TIME_BYTES = 0x0004;
+        private const uint WHDR_DONE = 0x00000001;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct WAVEFORMATEX
+        {
+            public ushort wFormatTag;
+            public ushort nChannels;
+            public uint nSamplesPerSec;
+            public uint nAvgBytesPerSec;
+            public ushort nBlockAlign;
+            public ushort wBitsPerSample;
+            public ushort cbSize;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct WAVEHDR
+        {
+            public IntPtr lpData;
+            public uint dwBufferLength;
+            public uint dwBytesRecorded;
+            public IntPtr dwUser;
+            public uint dwFlags;
+            public uint dwLoops;
+            public IntPtr lpNext;
+            public IntPtr reserved;
+        }
+
+        /// <summary>
+        /// MMTIME 的真实布局是 wType + 4 字节 union = **8 字节**。
+        /// （早先多声明了 4 字节填充，靠 API 容忍超长结构才没出问题，这里改成真实布局。）
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MMTIME
+        {
+            public uint wType;
+            public uint val;
+        }
+
+        [DllImport("winmm.dll")] private static extern int waveOutOpen(out IntPtr hwo, uint dev, ref WAVEFORMATEX fmt, IntPtr callback, IntPtr inst, uint flags);
+        [DllImport("winmm.dll")] private static extern int waveOutPrepareHeader(IntPtr hwo, IntPtr hdr, int size);
+        [DllImport("winmm.dll")] private static extern int waveOutUnprepareHeader(IntPtr hwo, IntPtr hdr, int size);
+        [DllImport("winmm.dll")] private static extern int waveOutWrite(IntPtr hwo, IntPtr hdr, int size);
+        [DllImport("winmm.dll")] private static extern int waveOutReset(IntPtr hwo);
+        [DllImport("winmm.dll")] private static extern int waveOutClose(IntPtr hwo);
+        [DllImport("winmm.dll")] private static extern int waveOutPause(IntPtr hwo);
+        [DllImport("winmm.dll")] private static extern int waveOutRestart(IntPtr hwo);
+        [DllImport("winmm.dll")] private static extern int waveOutGetPosition(IntPtr hwo, ref MMTIME t, int size);
+
+        private string _path;
+        private double _lengthMs;
+        private double _startMs;          // 本次播放的起点（毫秒）
+        private string _lastError = "";
+        private IntPtr _hwo = IntPtr.Zero;
+        private IntPtr[] _bufs;           // 每块的数据内存
+        private IntPtr[] _hdrs;           // 每块的 WAVEHDR
+        private int _hdrSize;
+        private Process _proc;
+        private Thread _feeder;
+        private System.Windows.Forms.Timer _rangeTimer;
+        private double _rangeEndMs = -1;
+
+        private volatile bool _stop;
+        private volatile bool _eof;
+        private volatile bool _playing;
+        private volatile bool _paused;
+        /// <summary>
+        /// 每次 Start 自增。喂数线程启动时记下自己的代号，之后每次写缓冲前都核对一次；
+        /// 一旦不相等就说明「这次播放已经被新的播放取代」，必须立刻退出，绝不能再去碰
+        /// 已经易主的缓冲或设备句柄。
+        /// </summary>
+        private volatile int _generation;
+        private long _written;            // 已送入设备的采样数（用 Interlocked 访问）
+
+        public bool IsOpen { get { return _path != null; } }
+        public double LengthMs { get { return _lengthMs; } }
+        public string LastError { get { return _lastError; } }
+
+        public double PositionMs
+        {
+            get
+            {
+                if (_path == null) { return 0; }
+                if (!_playing && !_paused) { return _startMs; }
+                double ms = _startMs + PlayedSamples(_hwo) * 1000.0 / Rate;
+                if (_lengthMs > 0 && ms > _lengthMs) { ms = _lengthMs; }
+                return ms;
+            }
+        }
+
+        public bool IsPlaying
+        {
+            get
+            {
+                if (!_playing || _paused) { return false; }
+                if (_eof && PlayedSamples(_hwo) >= Interlocked.Read(ref _written)) { return false; }
+                return true;
+            }
+        }
+
+        public string Open(string path) { return Open(path, 0); }
+
+        /// <summary>
+        /// 只探测文件可读性与时长；真正解码在按下播放时才开始。
+        /// durationHint &gt; 0 时直接采用（调用方已经知道时长），
+        /// 避免在 UI 线程里再同步跑一次 ffmpeg 探测导致卡顿。
+        /// </summary>
+        public string Open(string path, double durationHint)
+        {
+            Close();
+            _lastError = "";
+            if (string.IsNullOrEmpty(path)) { _lastError = "未提供文件。"; return _lastError; }
+            if (!File.Exists(path)) { _lastError = "找不到文件：" + path; return _lastError; }
+            double dur = durationHint;
+            if (dur <= 0.05) { dur = Extractor.ProbeDuration(path); }
+            if (dur <= 0.05) { _lastError = "无法读取该文件（时长无效）。"; return _lastError; }
+            _path = path;
+            _lengthMs = dur * 1000.0;
+            _startMs = 0;
+            return null;
+        }
+
+        public void PlayFrom(double ms) { Start(ms, -1); }
+
+        public void PlayRange(double fromMs, double toMs) { Start(fromMs, toMs); }
+
+        public void Pause()
+        {
+            if (_hwo == IntPtr.Zero || !_playing || _paused) { return; }
+            try { waveOutPause(_hwo); } catch (Exception) { }
+            _paused = true;
+        }
+
+        public void Stop()
+        {
+            StopInternal();
+            _startMs = 0;
+        }
+
+        public void Seek(double ms)
+        {
+            if (_path == null) { return; }
+            if (_playing || _paused) { Start(ms, -1); }
+            else { _startMs = Math.Max(0, ms); }
+        }
+
+        public void Close()
+        {
+            StopInternal();
+            _path = null;
+            _lengthMs = 0;
+            _startMs = 0;
+        }
+
+        public void Dispose() { Close(); }
+
+        // ---------------- 内部 ----------------
+
+        /// <summary>
+        /// 设备已播放的采样数。
+        /// 必须先把 MMTIME.wType 设成 TIME_SAMPLES —— 否则设备会按自己的默认格式返回
+        /// （实测返回的是字节数），把字节当采样用会让播放头走得快一倍。
+        /// </summary>
+        private static long PlayedSamples(IntPtr hwo)
+        {
+            if (hwo == IntPtr.Zero) { return 0; }
+            try
+            {
+                MMTIME t = new MMTIME();
+                t.wType = TIME_SAMPLES;
+                if (waveOutGetPosition(hwo, ref t, Marshal.SizeOf(typeof(MMTIME))) != 0) { return 0; }
+                if (t.wType == TIME_BYTES) { return (long)t.val / 2; }                   // 单声道 16bit：2 字节/采样
+                if (t.wType == TIME_MS) { return (long)(t.val * (Rate / 1000.0)); }       // 毫秒兜底
+                return t.val;
+            }
+            catch (Exception) { return 0; }
+        }
+
+        /// <summary>
+        /// 某块缓冲是否已播完、可以复用。
+        /// 主判据是 waveOutGetPosition 的推进；但该 API 在个别驱动上会恒返回 0，
+        /// 那样喂满 3 块（240ms）之后就会永久卡死，所以再补一条 WAVEHDR 的 WHDR_DONE 判据。
+        /// </summary>
+        private static bool BufferFree(IntPtr hwo, IntPtr hdr, long startSample)
+        {
+            if (startSample < 0) { return true; }                 // 从未用过
+            WAVEHDR h = (WAVEHDR)Marshal.PtrToStructure(hdr, typeof(WAVEHDR));
+            if ((h.dwFlags & WHDR_DONE) != 0) { return true; }    // 驱动已交回
+            return PlayedSamples(hwo) >= startSample + ChunkSamples;
+        }
+
+        private void StopInternal()
+        {
+            _stop = true;
+            _generation++;              // 让仍在运行的喂数线程立刻失效
+            _playing = false;
+            _paused = false;
+            StopRangeTimer();
+
+            // 先杀 ffmpeg：它一停，阻塞在读取上的喂数线程就会立刻返回
+            if (_proc != null)
+            {
+                try { if (!_proc.HasExited) { _proc.Kill(); } } catch (Exception) { }
+            }
+
+            Thread f = _feeder;
+            _feeder = null;
+            bool exited = true;
+            if (f != null)
+            {
+                try { exited = f.Join(JoinTimeoutMs); } catch (Exception) { }
+            }
+
+            if (exited)
+            {
+                if (_hwo != IntPtr.Zero)
+                {
+                    try { waveOutReset(_hwo); } catch (Exception) { }
+                    if (_hdrs != null)
+                    {
+                        for (int i = 0; i < ChunkCount; i++)
+                        {
+                            if (_hdrs[i] != IntPtr.Zero)
+                            {
+                                try { waveOutUnprepareHeader(_hwo, _hdrs[i], _hdrSize); } catch (Exception) { }
+                            }
+                        }
+                    }
+                    try { waveOutClose(_hwo); } catch (Exception) { }
+                    _hwo = IntPtr.Zero;
+                }
+                FreeBuffers();
+            }
+            else
+            {
+                // 喂数线程没能在超时内退出（例如驱动卡在 waveOutWrite 上）：
+                // 此时**绝不能**释放它仍可能访问的非托管缓冲，否则就是 use-after-free。
+                // 宁可弃置这一组缓冲（几百 KB，进程退出时由系统回收），也不能崩。
+                _hwo = IntPtr.Zero;
+                _bufs = null;
+                _hdrs = null;
+            }
+
+            if (_proc != null)
+            {
+                try { _proc.Dispose(); } catch (Exception) { }
+                _proc = null;
+            }
+            _eof = false;
+            Interlocked.Exchange(ref _written, 0);
+        }
+
+        private void FreeBuffers()
+        {
+            if (_bufs != null)
+            {
+                for (int i = 0; i < ChunkCount; i++)
+                {
+                    if (_bufs[i] != IntPtr.Zero) { Marshal.FreeHGlobal(_bufs[i]); _bufs[i] = IntPtr.Zero; }
+                }
+                _bufs = null;
+            }
+            if (_hdrs != null)
+            {
+                for (int i = 0; i < ChunkCount; i++)
+                {
+                    if (_hdrs[i] != IntPtr.Zero) { Marshal.FreeHGlobal(_hdrs[i]); _hdrs[i] = IntPtr.Zero; }
+                }
+                _hdrs = null;
+            }
+        }
+
+        private void Start(double fromMs, double toMs)
+        {
+            if (_path == null) { return; }
+            StopInternal();
+            _stop = false;
+            _eof = false;
+            Interlocked.Exchange(ref _written, 0);
+            _startMs = Math.Max(0, fromMs);
+            _lastError = "";
+
+            WAVEFORMATEX fmt = new WAVEFORMATEX();
+            fmt.wFormatTag = 1;                       // WAVE_FORMAT_PCM
+            fmt.nChannels = 1;
+            fmt.nSamplesPerSec = (uint)Rate;
+            fmt.wBitsPerSample = 16;
+            fmt.nBlockAlign = (ushort)(fmt.nChannels * fmt.wBitsPerSample / 8);
+            fmt.nAvgBytesPerSec = fmt.nSamplesPerSec * fmt.nBlockAlign;
+
+            IntPtr hwo;
+            if (waveOutOpen(out hwo, WAVE_MAPPER, ref fmt, IntPtr.Zero, IntPtr.Zero, CALLBACK_NULL) != 0)
+            {
+                // 以前这里静默返回，导致「点了播放却毫无反应」；现在把原因交给界面显示
+                _lastError = "无法打开音频输出设备（可能没有可用声卡，或被其它程序独占）。";
+                return;
+            }
+            _hwo = hwo;
+
+            int hdrSize = Marshal.SizeOf(typeof(WAVEHDR));
+            IntPtr[] bufs = new IntPtr[ChunkCount];
+            IntPtr[] hdrs = new IntPtr[ChunkCount];
+            _hdrSize = hdrSize;
+            _bufs = bufs;
+            _hdrs = hdrs;
+
+            Process proc = null;
+            try
+            {
+                for (int i = 0; i < ChunkCount; i++)
+                {
+                    bufs[i] = Marshal.AllocHGlobal(ChunkBytes);
+                    hdrs[i] = Marshal.AllocHGlobal(hdrSize);
+                    WAVEHDR h = new WAVEHDR();
+                    h.lpData = bufs[i];
+                    h.dwBufferLength = (uint)ChunkBytes;
+                    Marshal.StructureToPtr(h, hdrs[i], false);
+                    waveOutPrepareHeader(hwo, hdrs[i], hdrSize);
+                }
+
+                string args = "-hide_banner -loglevel error -nostdin -ss " +
+                              (_startMs / 1000.0).ToString("0.###", CultureInfo.InvariantCulture);
+                if (toMs > 0)
+                {
+                    args += " -t " + ((toMs - _startMs) / 1000.0).ToString("0.###", CultureInfo.InvariantCulture);
+                }
+                args += " -i " + Extractor.Quote(_path) + " -vn -ac 1 -ar " + Rate + " -f s16le pipe:1";
+
+                ProcessStartInfo psi = new ProcessStartInfo(Tools.FfmpegPath, args);
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.RedirectStandardOutput = true;
+                psi.RedirectStandardError = true;
+                proc = Process.Start(psi);
+            }
+            catch (Exception ex)
+            {
+                _lastError = "无法启动解码进程：" + ex.Message;
+                if (proc != null) { try { if (!proc.HasExited) { proc.Kill(); } } catch (Exception) { } }
+                StopInternal();
+                return;
+            }
+
+            _proc = proc;
+            _playing = true;
+            _paused = false;
+            if (toMs > 0) { _rangeEndMs = Math.Max(fromMs + 50, toMs); StartRangeTimer(); }
+
+            int gen = ++_generation;
+            Thread t = new Thread(delegate() { FeedLoop(gen, hwo, bufs, hdrs, proc); });
+            t.IsBackground = true;
+            _feeder = t;
+            t.Start();
+        }
+
+        /// <summary>
+        /// 喂数线程：从 ffmpeg 的 stdout 读 PCM，填进三块循环缓冲交给 waveOut。
+        /// 缓冲与设备句柄都由**本线程自己持有**（启动时捕获），不再从字段读，
+        /// 配合 generation 代号，避免与下一次播放争用同一组资源。
+        /// </summary>
+        private void FeedLoop(int gen, IntPtr hwo, IntPtr[] bufs, IntPtr[] hdrs, Process proc)
+        {
+            byte[] data = new byte[ChunkBytes];
+            long[] bufStart = new long[ChunkCount];
+            for (int i = 0; i < ChunkCount; i++) { bufStart[i] = -1; }
+            int next = 0;
+            int hdrSize = Marshal.SizeOf(typeof(WAVEHDR));
+
+            Stream input;
+            try { input = proc.StandardOutput.BaseStream; }
+            catch (Exception) { _eof = true; return; }
+
+            while (!_stop && gen == _generation)
+            {
+                int i = next;
+                if (!BufferFree(hwo, hdrs[i], bufStart[i]))
+                {
+                    Thread.Sleep(5);
+                    continue;
+                }
+
+                int got;
+                try { got = input.Read(data, 0, data.Length); }
+                catch (Exception) { break; }
+                if (got <= 0) { break; }
+                if ((got & 1) == 1) { got--; }
+                if (got <= 0) { continue; }
+
+                // 已经过期（新的播放开始了）就立刻收手，绝不碰不属于自己的缓冲
+                if (_stop || gen != _generation) { break; }
+
+                Marshal.Copy(data, 0, bufs[i], got);
+                WAVEHDR h = (WAVEHDR)Marshal.PtrToStructure(hdrs[i], typeof(WAVEHDR));
+                h.dwBufferLength = (uint)got;
+                // 只能清 WHDR_DONE：WHDR_PREPARED 是 waveOutPrepareHeader 设的，
+                // 一起清掉会让 waveOutWrite 直接失败（缓冲永远播不出来）。
+                h.dwFlags = h.dwFlags & ~WHDR_DONE;
+                Marshal.StructureToPtr(h, hdrs[i], false);
+
+                bufStart[i] = Interlocked.Read(ref _written);
+                Interlocked.Add(ref _written, got / 2);
+
+                if (waveOutWrite(hwo, hdrs[i], hdrSize) != 0)
+                {
+                    // 以前不检查返回值：写入失败时数据被丢，但 _written 仍自增，
+                    // 会让播放按钮一直卡在「暂停」。现在直接结束并留下原因。
+                    _lastError = "写入音频设备失败（waveOutWrite）。";
+                    break;
+                }
+                next = (i + 1) % ChunkCount;
+            }
+            _eof = true;
+        }
+
+        private void StartRangeTimer()
+        {
+            if (_rangeTimer == null)
+            {
+                _rangeTimer = new System.Windows.Forms.Timer();
+                _rangeTimer.Interval = 40;
+                _rangeTimer.Tick += delegate(object s, EventArgs e) { OnRangeTick(); };
+            }
+            _rangeTimer.Start();
+        }
+
+        private void StopRangeTimer()
+        {
+            if (_rangeTimer != null) { _rangeTimer.Stop(); }
+        }
+
+        /// <summary>MediaPlayer 没有「播到某处自动停」，用定时器实现「只播放选区」。</summary>
+        private void OnRangeTick()
+        {
+            if (!_playing || _rangeEndMs <= 0) { StopRangeTimer(); return; }
+            if (PositionMs >= _rangeEndMs)
+            {
+                StopInternal();
+                StopRangeTimer();
+            }
+        }
+    }
 }
