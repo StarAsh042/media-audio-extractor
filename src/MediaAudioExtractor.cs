@@ -257,6 +257,7 @@ namespace MediaAudioExtractor
                 throw new InvalidOperationException(
                     "网址无效：只接受以 http:// 或 https:// 开头、且不含引号或空白的网址。");
             }
+            url = ApplyUrlFix(url);
             ResetWorkDir(workDir);
 
             string template = Path.Combine(workDir, "media.%(ext)s");
@@ -325,6 +326,65 @@ namespace MediaAudioExtractor
             if (quality == "low") { return "\"bestaudio[abr<=70]/bestaudio/best\""; }
             if (quality == "std") { return "\"bestaudio[abr<=128]/bestaudio/best\""; }
             return "bestaudio/best";
+        }
+
+        // ============ 一B、下载【完整视频】（不解码、不生成波形） ============
+        public string DownloadVideo(string url, string outDir, string quality, string workDir)
+        {
+            Tools.Ensure();
+            _cancel = false;
+            // 网址会被拼进 yt-dlp 命令行，先挡住能突破引号边界的输入
+            if (!IsSafeUrl(url))
+            {
+                throw new InvalidOperationException(
+                    "网址无效：只接受以 http:// 或 https:// 开头、且不含引号或空白的网址。");
+            }
+            url = ApplyUrlFix(url);
+            ResetWorkDir(workDir);
+
+            string template = Path.Combine(workDir, "media.%(ext)s");
+            string titleFile = Path.Combine(workDir, "title.txt");
+            string args = "--no-warnings --newline --no-playlist --no-mtime" +
+                          " --print-to-file " + Quote("%(title)s") + " " + Quote(titleFile) +
+                          " --retries 10 --fragment-retries 10 --socket-timeout 20" +
+                          " --ffmpeg-location " + Quote(Tools.Dir) +
+                          " --merge-output-format mp4" +
+                          " -f " + VideoQualitySelector(quality) +
+                          " -o " + Quote(template) + " " + Quote(url);
+
+            EmitStatus("正在下载视频 …");
+            int code = RunYtDlp(args);
+            ThrowIfCancelled();
+            if (code != 0)
+            {
+                throw new InvalidOperationException("视频下载失败（yt-dlp 退出码 " + code +
+                    "）。请检查网址是否正确，或该内容是否需要登录。");
+            }
+
+            string src = PickMediaFile(workDir);
+            if (src == null)
+            {
+                EmitLog("工作目录内容：" + ListDir(workDir));
+                throw new InvalidOperationException("没有找到下载到的视频文件。");
+            }
+            string title = ReadFirstLine(titleFile);
+            if (string.IsNullOrEmpty(title)) { title = "video"; }
+            EmitLog("已下载视频：" + Path.GetFileName(src) + "（" + (new FileInfo(src).Length / 1024) + " KB）");
+            EmitLog("标题：" + title);
+
+            // 完整视频保存到用户目录（中文/空格路径由 .NET 处理，不交给外部程序）
+            string keepName = SanitizeName(title) + Path.GetExtension(src);
+            string keepPath = UniquePath(Path.Combine(outDir, keepName));
+            File.Copy(src, keepPath, false);
+            EmitLog("视频已保存：" + keepPath);
+            return keepPath;
+        }
+
+        private static string VideoQualitySelector(string quality)
+        {
+            if (quality == "low") { return "\"bestvideo[height<=720]+bestaudio/bestvideo[height<=720]/best\""; }
+            if (quality == "std") { return "\"bestvideo[height<=1080]+bestaudio/bestvideo[height<=1080]/best\""; }
+            return "\"bestvideo+bestaudio/best\"";
         }
 
         /// <summary>
@@ -847,7 +907,7 @@ namespace MediaAudioExtractor
 
         private static string PickMediaFile(string dir)
         {
-            string[] exts = { ".m4a", ".mp4", ".aac", ".webm", ".opus", ".mp3", ".ogg", ".mka", ".wav", ".flac" };
+            string[] exts = { ".m4a", ".mp4", ".aac", ".webm", ".opus", ".mp3", ".ogg", ".mka", ".wav", ".flac", ".mkv" };
             string best = null;
             long bestLen = -1;
             string[] files = Directory.GetFiles(dir);
@@ -1008,6 +1068,82 @@ namespace MediaAudioExtractor
                 if (c == '"' || char.IsWhiteSpace(c) || char.IsControl(c)) { return false; }
             }
             return true;
+        }
+
+        // B 站网页版会把界面语言写进路径：/zh-Hans/video/BV... 、/en-US/video/BV... 。
+        // yt-dlp 没有对应的解析器，这种地址只能落到通用解析器上，结果是「下载到一个 html」并直接失败，
+        // 用户看到的是「下载失败」，其实粘的地址没错。这里把它改回标准地址；参数（?p= / ?vd_source= 等）原样保留。
+        private static readonly string[] LocaleSegments =
+            { "zh-Hans", "zh-MO", "zh-TW", "zh-CN", "zh-HK", "en-US", "pt-BR", "zh" };
+        private static readonly string[] BiliPathWords =
+            { "video", "favlist", "favorite", "space", "list", "bangumi", "medialist", "read", "opus", "channel", "collections" };
+
+        /// <summary>
+        /// 把用户粘贴的文本整理成 yt-dlp 能直接用的网址：
+        /// 先从分享文案里挑出 http / https 链接（地址常常被中文包裹），
+        /// 再补 bilibili 视频号（BV / av）——手机端分享的 b23.tv 短链、甚至只给一个裸 BV 号也认，
+        /// 最后去掉站点写进路径的语言段（/zh-Hans/video/… → /video/…）。
+        /// 找不到任何可用网址时返回 null。
+        /// </summary>
+        public static string NormalizeMediaUrl(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) { return null; }
+            string s = raw.Trim();
+            Match m = Regex.Match(s, @"https?://[^\s""'<>]+");
+            bool hasLink = m.Success;
+            if (hasLink) { s = m.Value; }
+
+            // BV / av 视频号：短链（b23.tv）或分享文案里只有裸编号时，拼成标准地址。
+            // 已经是 /video/ 形式的地址不动它（多 P 的 ?p= 参数要原样保留，交给下面的语言段处理）。
+            if (!Regex.IsMatch(s, @"/video/", RegexOptions.IgnoreCase))
+            {
+                Match bv = Regex.Match(s, @"BV[0-9A-Za-z]{5,12}");
+                Match av = Regex.Match(s, @"(?:^|[^A-Za-z0-9])av(\d{1,12})", RegexOptions.IgnoreCase);
+                if (bv.Success) { s = "https://www.bilibili.com/video/" + bv.Value + "/"; }
+                else if (av.Success && (Regex.IsMatch(s, @"bilibili\.com|b23\.tv", RegexOptions.IgnoreCase) || !hasLink))
+                {
+                    s = "https://www.bilibili.com/video/av" + av.Groups[1].Value + "/";
+                }
+            }
+
+            if (!IsSafeUrl(s)) { return hasLink ? s : null; }
+
+            // 去掉 B 站路径里的语言段（只认「语言段 + 已知栏目」的组合，避免误伤正常地址）
+            Match l = Regex.Match(s,
+                @"^(https?://(?:www\.|m\.)?bilibili\.com)/([A-Za-z][A-Za-z0-9-]{1,7})/",
+                RegexOptions.IgnoreCase);
+            if (l.Success)
+            {
+                string seg = l.Groups[2].Value;
+                string tail = s.Substring(l.Index + l.Length);
+                bool segIsLocale = false;
+                for (int i = 0; i < LocaleSegments.Length; i++)
+                {
+                    if (string.Equals(seg, LocaleSegments[i], StringComparison.OrdinalIgnoreCase)) { segIsLocale = true; break; }
+                }
+                bool tailIsPath = false;
+                for (int i = 0; i < BiliPathWords.Length; i++)
+                {
+                    if (tail.StartsWith(BiliPathWords[i], StringComparison.OrdinalIgnoreCase)) { tailIsPath = true; break; }
+                }
+                if (segIsLocale && tailIsPath)
+                {
+                    s = l.Groups[1].Value + "/" + tail;
+                }
+            }
+            return s;
+        }
+
+        /// <summary>下载入口用：整理网址并在日志里说明改了什么（没改就原样返回）。</summary>
+        private string ApplyUrlFix(string url)
+        {
+            string n = NormalizeMediaUrl(url);
+            if (!string.IsNullOrEmpty(n) && n != url)
+            {
+                EmitLog("已自动整理网址：" + url + "  →  " + n);
+                return n;
+            }
+            return url;
         }
 
         private static string BuildSuffix(double start, double dur)
@@ -2536,6 +2672,7 @@ namespace MediaAudioExtractor
         private TextBox _txtOut;
         private Button _btnBrowse;
         private Button _btnDownload;
+        private Button _btnVideo;
         private Button _btnCancel;
         private FlatProgress _barDown;
         private Label _lblDownStatus;
@@ -2669,6 +2806,11 @@ namespace MediaAudioExtractor
             _btnBrowse.Click += OnBrowse;
 
             // 操作按钮统一靠右（贴合「确定 / 取消在右下」的习惯），进度条占据左侧剩余空间
+            _btnVideo = MakeButton("下载视频", 588, 89, 110, 28, AnchorStyles.Top | AnchorStyles.Right);
+            _btnVideo.Click += OnDownloadVideo;
+            // 进阶功能：默认藏起来，连按三次「↓」才显示（见 ProcessCmdKey）
+            _btnVideo.Visible = false;
+
             _btnDownload = MakeButton("① 下载完整音频", 706, 89, 140, 28, AnchorStyles.Top | AnchorStyles.Right);
             _btnDownload.Font = new Font(uiFont, FontStyle.Bold);
             _btnDownload.Click += OnDownload;
@@ -2678,19 +2820,19 @@ namespace MediaAudioExtractor
 
             _barDown = new FlatProgress();
             _barDown.Location = new Point(90, 94);
-            _barDown.Size = new Size(400, 18);
+            _barDown.Size = new Size(250, 18);
             _barDown.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
 
             _lblDownStatus = new Label();
             _lblDownStatus.Text = "";
-            _lblDownStatus.Location = new Point(498, 91);
-            _lblDownStatus.Size = new Size(200, 20);
+            _lblDownStatus.Location = new Point(348, 91);
+            _lblDownStatus.Size = new Size(230, 20);
             _lblDownStatus.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             _lblDownStatus.Tag = "accent";
             _lblDownStatus.ForeColor = Color.FromArgb(30, 90, 170);
 
             g1.Controls.AddRange(new Control[] { l1, _txtUrl, _btnPaste, l2, _cmbQuality,
-                                                 l3, _txtOut, _btnBrowse, _btnDownload, _btnCancel,
+                                                 l3, _txtOut, _btnBrowse, _btnVideo, _btnDownload, _btnCancel,
                                                  _barDown, _lblDownStatus });
 
             // ---------- 第 2 步 ----------
@@ -2931,8 +3073,9 @@ namespace MediaAudioExtractor
             string url = null;
             if (localPath == null)
             {
-                Match m = Regex.Match(raw, @"https?://[^\s]+");
-                if (m.Success) { url = m.Value; }
+                // 分享文案里常夹着中文、或只给 BV 号 / b23.tv 短链：先整理成标准网址
+                string n = Extractor.NormalizeMediaUrl(raw);
+                if (n != null && Extractor.IsSafeUrl(n)) { url = n; }
             }
             if (localPath == null && url == null)
             {
@@ -2996,6 +3139,130 @@ namespace MediaAudioExtractor
             Thread t = new Thread(new ThreadStart(delegate { JobDownload(p[0], p[1], p[2], p[3]); }));
             t.IsBackground = true;
             t.Start();
+        }
+
+        // ---------------- 第 1 步（视频）：下载完整视频（不做波形、不影响试听） ----------------
+        private void OnDownloadVideo(object sender, EventArgs e)
+        {
+            if (_busy) { return; }
+
+            // 下载视频只接受网址：本地文件本来就在硬盘上，走「下载完整音频」载入即可
+            string raw = _txtUrl.Text.Trim();
+            // UNC 路径要在这里就拦住：File.Exists 本身就会向对方主机发起 SMB 连接
+            if (Extractor.IsUncPath(raw))
+            {
+                AppendLog("✘ 已拒绝网络路径（\\\\ 开头）：载入它会向该地址发起 SMB 连接并可能泄露本机凭据。");
+                if (!Silent)
+                {
+                    MessageBox.Show(this,
+                        "不支持网络路径（\\\\ 开头）。\n" +
+                        "载入它会向该地址发起 SMB 连接并可能泄露本机凭据；\n" +
+                        "请先把文件复制到本地磁盘再载入。",
+                        "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+                return;
+            }
+            // 分享文案里常夹着中文、或只给 BV 号 / b23.tv 短链：先整理成标准网址
+            string url = Extractor.NormalizeMediaUrl(raw);
+            if (url == null)
+            {
+                if (!Silent)
+                {
+                    MessageBox.Show(this,
+                        "请输入视频网址（以 http:// 或 https:// 开头，或 B 站 BV 号 / 分享文案）。\n" +
+                        "「下载视频」只支持网址；本地文件请用「① 下载完整音频」载入。",
+                        "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+                return;
+            }
+            string outDir = _txtOut.Text.Trim();
+            if (outDir.Length == 0)
+            {
+                if (!Silent) { MessageBox.Show(this, "请选择保存位置。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+                return;
+            }
+            try { Directory.CreateDirectory(outDir); }
+            catch (Exception ex)
+            {
+                _lblDownStatus.Text = "无法使用该保存位置";
+                if (!Silent)
+                {
+                    MessageBox.Show(this, "无法使用该保存位置：\n" + ex.Message, "提示",
+                                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+                return;
+            }
+
+            string quality = "best";
+            if (_cmbQuality.SelectedIndex == 1) { quality = "std"; }
+            else if (_cmbQuality.SelectedIndex == 2) { quality = "low"; }
+
+            // 不触碰 _session/_player/_wave：视频下载与试听互不干扰
+            _cancel = false;
+            _busy = true;
+            _barDown.Marquee = false;
+            _barDown.Value = 0;
+            UpdateUiState();
+            AppendLog("=== 开始下载视频 ===");
+            AppendLog("网址：" + url);
+            AppendLog("画质：" + _cmbQuality.Text + "    保存到：" + outDir);
+
+            string[] p = new string[] { url, outDir, quality };
+            Thread t = new Thread(new ThreadStart(delegate { JobDownloadVideo(p[0], p[1], p[2]); }));
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        private void JobDownloadVideo(string url, string outDir, string quality)
+        {
+            Extractor ex = new Extractor();
+            ex.Log += delegate(string s) { LogLine(s); };
+            ex.Status += delegate(string s) { Post(delegate { _lblDownStatus.Text = s; }); };
+            ex.Progress += delegate(int v) { Post(delegate { SetProgress(_barDown, v); }); };
+            _cancelEngine = ex;
+            try
+            {
+                string path = ex.DownloadVideo(url, outDir, quality, WorkDir);
+                Post(delegate
+                {
+                    _busy = false;
+                    _barDown.Marquee = false;
+                    _barDown.Value = 100;
+                    _lblDownStatus.Text = "视频下载完成";
+                    _lastFile = path;
+                    AppendLog("✔ 视频已保存：" + path);
+                    UpdateUiState();
+                });
+            }
+            catch (Exception err)
+            {
+                bool cancelled = _cancel;
+                Post(delegate
+                {
+                    _busy = false;
+                    _barDown.Marquee = false;
+                    UpdateUiState();
+                    if (cancelled)
+                    {
+                        _lblDownStatus.Text = "已取消";
+                        AppendLog("视频下载已取消。");
+                    }
+                    else
+                    {
+                        _lblDownStatus.Text = "视频下载失败";
+                        AppendLog("✘ 视频下载失败：" + err.Message);
+                        if (!Silent)
+                        {
+                            MessageBox.Show(this, err.Message, "视频下载失败",
+                                            MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        }
+                    }
+                });
+            }
+            finally
+            {
+                _cancelEngine = null;
+            }
         }
 
         private void JobDownload(string url, string localPath, string outDir, string quality)
@@ -3653,6 +3920,7 @@ namespace MediaAudioExtractor
             _btnBrowse.Enabled = idle;
             _cmbQuality.Enabled = idle && !local;
             _btnDownload.Enabled = idle && tools;
+            _btnVideo.Enabled = idle && tools && !local;
             _btnCancel.Enabled = !idle;
 
             _wave.Enabled = has;
@@ -3703,6 +3971,29 @@ namespace MediaAudioExtractor
             _ticker.Stop();
             try { _player.Close(); } catch (Exception) { }
             base.OnFormClosing(e);
+        }
+
+        // ---------------- 隐藏功能：连按三次「↓」显示「下载视频」按钮 ----------------
+        private int _downStreak;
+
+        // 用 ProcessCmdKey 而不是 KeyDown：焦点多半在网址输入框里，方向键会被输入框吃掉。
+        // 这里只记账、不吞键（一律交回 base），所以输入框里的光标移动不受影响。
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            if (keyData == Keys.Down)
+            {
+                _downStreak++;
+                if (_downStreak >= 3 && !_btnVideo.Visible)
+                {
+                    _btnVideo.Visible = true;
+                    AppendLog("已显示「下载视频」按钮（直接下载完整视频，不生成波形）。");
+                }
+            }
+            else
+            {
+                _downStreak = 0;
+            }
+            return base.ProcessCmdKey(ref msg, keyData);
         }
 
         // ---------------- 主题（跟随系统浅色 / 深色） ----------------
@@ -3793,6 +4084,7 @@ namespace MediaAudioExtractor
         internal double ProbeSelEnd { get { return _wave.SelEnd; } }
         internal double ProbePosition { get { return _wave.Position; } }
         internal Button ProbeDownloadButton { get { return _btnDownload; } }
+        internal Button ProbeVideoButton { get { return _btnVideo; } }
         internal Button ProbeExportButton { get { return _btnExport; } }
         internal Button ProbePlayButton { get { return _btnPlay; } }
         internal Button ProbeAuditionButton { get { return _btnAudition; } }
