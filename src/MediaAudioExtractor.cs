@@ -257,6 +257,7 @@ namespace MediaAudioExtractor
                 throw new InvalidOperationException(
                     "网址无效：只接受以 http:// 或 https:// 开头、且不含引号或空白的网址。");
             }
+            url = ApplyUrlFix(url);
             ResetWorkDir(workDir);
 
             string template = Path.Combine(workDir, "media.%(ext)s");
@@ -338,6 +339,7 @@ namespace MediaAudioExtractor
                 throw new InvalidOperationException(
                     "网址无效：只接受以 http:// 或 https:// 开头、且不含引号或空白的网址。");
             }
+            url = ApplyUrlFix(url);
             ResetWorkDir(workDir);
 
             string template = Path.Combine(workDir, "media.%(ext)s");
@@ -1066,6 +1068,82 @@ namespace MediaAudioExtractor
                 if (c == '"' || char.IsWhiteSpace(c) || char.IsControl(c)) { return false; }
             }
             return true;
+        }
+
+        // B 站网页版会把界面语言写进路径：/zh-Hans/video/BV... 、/en-US/video/BV... 。
+        // yt-dlp 没有对应的解析器，这种地址只能落到通用解析器上，结果是「下载到一个 html」并直接失败，
+        // 用户看到的是「下载失败」，其实粘的地址没错。这里把它改回标准地址；参数（?p= / ?vd_source= 等）原样保留。
+        private static readonly string[] LocaleSegments =
+            { "zh-Hans", "zh-MO", "zh-TW", "zh-CN", "zh-HK", "en-US", "pt-BR", "zh" };
+        private static readonly string[] BiliPathWords =
+            { "video", "favlist", "favorite", "space", "list", "bangumi", "medialist", "read", "opus", "channel", "collections" };
+
+        /// <summary>
+        /// 把用户粘贴的文本整理成 yt-dlp 能直接用的网址：
+        /// 先从分享文案里挑出 http / https 链接（地址常常被中文包裹），
+        /// 再补 bilibili 视频号（BV / av）——手机端分享的 b23.tv 短链、甚至只给一个裸 BV 号也认，
+        /// 最后去掉站点写进路径的语言段（/zh-Hans/video/… → /video/…）。
+        /// 找不到任何可用网址时返回 null。
+        /// </summary>
+        public static string NormalizeMediaUrl(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) { return null; }
+            string s = raw.Trim();
+            Match m = Regex.Match(s, @"https?://[^\s""'<>]+");
+            bool hasLink = m.Success;
+            if (hasLink) { s = m.Value; }
+
+            // BV / av 视频号：短链（b23.tv）或分享文案里只有裸编号时，拼成标准地址。
+            // 已经是 /video/ 形式的地址不动它（多 P 的 ?p= 参数要原样保留，交给下面的语言段处理）。
+            if (!Regex.IsMatch(s, @"/video/", RegexOptions.IgnoreCase))
+            {
+                Match bv = Regex.Match(s, @"BV[0-9A-Za-z]{5,12}");
+                Match av = Regex.Match(s, @"(?:^|[^A-Za-z0-9])av(\d{1,12})", RegexOptions.IgnoreCase);
+                if (bv.Success) { s = "https://www.bilibili.com/video/" + bv.Value + "/"; }
+                else if (av.Success && (Regex.IsMatch(s, @"bilibili\.com|b23\.tv", RegexOptions.IgnoreCase) || !hasLink))
+                {
+                    s = "https://www.bilibili.com/video/av" + av.Groups[1].Value + "/";
+                }
+            }
+
+            if (!IsSafeUrl(s)) { return hasLink ? s : null; }
+
+            // 去掉 B 站路径里的语言段（只认「语言段 + 已知栏目」的组合，避免误伤正常地址）
+            Match l = Regex.Match(s,
+                @"^(https?://(?:www\.|m\.)?bilibili\.com)/([A-Za-z][A-Za-z0-9-]{1,7})/",
+                RegexOptions.IgnoreCase);
+            if (l.Success)
+            {
+                string seg = l.Groups[2].Value;
+                string tail = s.Substring(l.Index + l.Length);
+                bool segIsLocale = false;
+                for (int i = 0; i < LocaleSegments.Length; i++)
+                {
+                    if (string.Equals(seg, LocaleSegments[i], StringComparison.OrdinalIgnoreCase)) { segIsLocale = true; break; }
+                }
+                bool tailIsPath = false;
+                for (int i = 0; i < BiliPathWords.Length; i++)
+                {
+                    if (tail.StartsWith(BiliPathWords[i], StringComparison.OrdinalIgnoreCase)) { tailIsPath = true; break; }
+                }
+                if (segIsLocale && tailIsPath)
+                {
+                    s = l.Groups[1].Value + "/" + tail;
+                }
+            }
+            return s;
+        }
+
+        /// <summary>下载入口用：整理网址并在日志里说明改了什么（没改就原样返回）。</summary>
+        private string ApplyUrlFix(string url)
+        {
+            string n = NormalizeMediaUrl(url);
+            if (!string.IsNullOrEmpty(n) && n != url)
+            {
+                EmitLog("已自动整理网址：" + url + "  →  " + n);
+                return n;
+            }
+            return url;
         }
 
         private static string BuildSuffix(double start, double dur)
@@ -2730,6 +2808,8 @@ namespace MediaAudioExtractor
             // 操作按钮统一靠右（贴合「确定 / 取消在右下」的习惯），进度条占据左侧剩余空间
             _btnVideo = MakeButton("下载视频", 588, 89, 110, 28, AnchorStyles.Top | AnchorStyles.Right);
             _btnVideo.Click += OnDownloadVideo;
+            // 进阶功能：默认藏起来，连按三次「↓」才显示（见 ProcessCmdKey）
+            _btnVideo.Visible = false;
 
             _btnDownload = MakeButton("① 下载完整音频", 706, 89, 140, 28, AnchorStyles.Top | AnchorStyles.Right);
             _btnDownload.Font = new Font(uiFont, FontStyle.Bold);
@@ -2993,8 +3073,9 @@ namespace MediaAudioExtractor
             string url = null;
             if (localPath == null)
             {
-                Match m = Regex.Match(raw, @"https?://[^\s]+");
-                if (m.Success) { url = m.Value; }
+                // 分享文案里常夹着中文、或只给 BV 号 / b23.tv 短链：先整理成标准网址
+                string n = Extractor.NormalizeMediaUrl(raw);
+                if (n != null && Extractor.IsSafeUrl(n)) { url = n; }
             }
             if (localPath == null && url == null)
             {
@@ -3081,19 +3162,19 @@ namespace MediaAudioExtractor
                 }
                 return;
             }
-            Match m = Regex.Match(raw, @"https?://[^\s]+");
-            if (!m.Success)
+            // 分享文案里常夹着中文、或只给 BV 号 / b23.tv 短链：先整理成标准网址
+            string url = Extractor.NormalizeMediaUrl(raw);
+            if (url == null)
             {
                 if (!Silent)
                 {
                     MessageBox.Show(this,
-                        "请输入视频网址（以 http:// 或 https:// 开头）。\n" +
+                        "请输入视频网址（以 http:// 或 https:// 开头，或 B 站 BV 号 / 分享文案）。\n" +
                         "「下载视频」只支持网址；本地文件请用「① 下载完整音频」载入。",
                         "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 }
                 return;
             }
-            string url = m.Value;
             string outDir = _txtOut.Text.Trim();
             if (outDir.Length == 0)
             {
@@ -3890,6 +3971,29 @@ namespace MediaAudioExtractor
             _ticker.Stop();
             try { _player.Close(); } catch (Exception) { }
             base.OnFormClosing(e);
+        }
+
+        // ---------------- 隐藏功能：连按三次「↓」显示「下载视频」按钮 ----------------
+        private int _downStreak;
+
+        // 用 ProcessCmdKey 而不是 KeyDown：焦点多半在网址输入框里，方向键会被输入框吃掉。
+        // 这里只记账、不吞键（一律交回 base），所以输入框里的光标移动不受影响。
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            if (keyData == Keys.Down)
+            {
+                _downStreak++;
+                if (_downStreak >= 3 && !_btnVideo.Visible)
+                {
+                    _btnVideo.Visible = true;
+                    AppendLog("已显示「下载视频」按钮（直接下载完整视频，不生成波形）。");
+                }
+            }
+            else
+            {
+                _downStreak = 0;
+            }
+            return base.ProcessCmdKey(ref msg, keyData);
         }
 
         // ---------------- 主题（跟随系统浅色 / 深色） ----------------
